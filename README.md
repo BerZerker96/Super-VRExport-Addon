@@ -109,6 +109,21 @@ Launch the viewer **after** the game has loaded. It reads `KatangaMappedFile` an
 
 ---
 
+## 🕹️ D3D9 Games — dgVoodoo2 Required
+
+Direct3D 9 games require an extra step because D3D9's shared texture support is limited and cross-process sharing with KatanaVR works most reliably through D3D11.
+
+**Use [dgVoodoo2](https://dege.freeweb.hu/dgVoodoo2/dgVoodoo2/) to translate D3D9 → D3D11:**
+
+1. Download [dgVoodoo2](https://dege.freeweb.hu/dgVoodoo2/dgVoodoo2/) and extract it
+2. Copy `D3D9.dll` (from dgVoodoo2's `MS\x64\` folder) into your game folder
+3. Install ReShade for the game selecting the **D3D11** API — ReShade will now intercept the translated D3D11 output
+4. Follow the standard setup steps above
+
+> Without dgVoodoo2 the addon will attempt a native D3D9 bridge path but this may fail or produce black frames depending on the game and driver. The D3D11 translation via dgVoodoo2 is the recommended and most reliable approach.
+
+---
+
 ## 🌐 Geo3D / Frame Sequential Games
 
 For games that natively output frame sequential stereo (e.g. Geo-3D titles):
@@ -124,8 +139,9 @@ For games that natively output frame sequential stereo (e.g. Geo-3D titles):
 
 | Symptom | Fix |
 |---|---|
-| KatanaVR shows nothing | Restart KatanaVR **after** the game loads. Check `ReShade.log` for `D3D12 ready` |
+| KatanaVR shows nothing | Restart KatanaVR **after** the game loads. Check `ReShade.log` for `D3D11 ready` / `D3D12 ready` |
 | Black screen in headset | Confirm `first copy fired` in `ReShade.log`. Restart KatanaVR |
+| D3D9 game: black / no connection | Use dgVoodoo2 to translate D3D9 → D3D11. See section above |
 | Addon not in ReShade list | Ensure `.addon64` is next to `dxgi.dll`; reinstall ReShade with "Install add-ons" checked |
 | `DoubleTex not found` loop | Normal on first launch — resolves within 3 seconds |
 | Virtual controller freeze | Wait 2 seconds — reload guard prevents infinite loop |
@@ -135,6 +151,7 @@ For games that natively output frame sequential stereo (e.g. Geo-3D titles):
 | Message | Meaning |
 |---|---|
 | `D3D12 ready (D3D11 bridge, ...)` | Bridge established — start KatanaVR now |
+| `D3D11 ready` | Bridge established — start KatanaVR now |
 | `first copy fired, src=... dst=...` | GPU copy is working |
 | `VR buffer not found` | texTOT temporarily unavailable during reload — resolves automatically |
 | `DoubleTex not found — forcing reload` | Normal on startup, triggers one shader recompile |
