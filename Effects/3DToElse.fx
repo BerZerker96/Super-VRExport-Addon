@@ -3,20 +3,21 @@
  //------------////
  
  //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
- //* Stereo Input Converter 1.2                           																														*//
- //* For Reshade 3.0																																								*//
+ //* Stereo Input Converter 1.2                       																																	*//
+ //* For Reshade 3.0																																									*//
  //* --------------------------																																						*//
  //* This work is licensed under a Creative Commons Attribution 3.0 Unported License.																								*//
  //* So you are free to share, modify and adapt it for your needs, and even use it for commercial use.																				*//
  //* I would also love to hear about a project you are using it with.																												*//
- //* https://creativecommons.org/licenses/by/3.0/us/																																*//
- //*																																												*//
- //* Have fun,																																										*//
+ //* https://creativecommons.org/licenses/by/3.0/us/																																	*//
+ //*																																													*//
+ //* Have fun,																																											*//
  //* Jose Negrete AKA BlueSkyDefender																																				*//
- //*																																												*//
+ //*																																													*//
  //* http://reshade.me/forum/shader-presentation/2128-sidebyside-3d-depth-map-based-stereoscopic-shader																				*//	
  //* ---------------------------------																																				*//
- //*																																												*//
+ //*																																													*//
+ //* Optimised for SuperVrExport / KatanaVR pipeline by SuperVrExport contributors.																									*//
  //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 uniform bool SbS_Half_Full <
@@ -84,8 +85,6 @@ uniform bool Eye_Swap <
 /////////////////////////////////////////////D3D Starts Here/////////////////////////////////////////////////////////////////
 #define pix float2(BUFFER_RCP_WIDTH, BUFFER_RCP_HEIGHT)
 #define TextureSize float2(BUFFER_WIDTH, BUFFER_HEIGHT)
-uniform float frametime < source = "frametime";>;
-uniform float timer < source = "timer"; >;	
 
 texture BackBufferTex : COLOR;
 
@@ -98,8 +97,10 @@ sampler BackBuffer
 	};
 
 texture texTOT  { Width = BUFFER_WIDTH*2; Height = BUFFER_HEIGHT; Format = RGB10A2;};
-texture texCL  { Width = BUFFER_WIDTH; Height = BUFFER_HEIGHT; Format = RGBA8;}; 
-texture texCR  { Width = BUFFER_WIDTH; Height = BUFFER_HEIGHT; Format = RGBA8;}; 
+// OPT: texCL/texCR upgraded from RGBA8 to RGB10A2 to match backbuffer and texTOT precision.
+// Eliminates precision loss in the L/R intermediate textures when the backbuffer is 10-bit.
+texture texCL  { Width = BUFFER_WIDTH; Height = BUFFER_HEIGHT; Format = RGB10A2;}; 
+texture texCR  { Width = BUFFER_WIDTH; Height = BUFFER_HEIGHT; Format = RGB10A2;}; 
 
 sampler SamplerCL
 	{
@@ -117,7 +118,7 @@ sampler SamplerCR
 		AddressW = BORDER;
 	};
 
-texture Current_BackBuffer_Tex  { Width = BUFFER_WIDTH; Height = BUFFER_HEIGHT; Format = RGBA8; }; 
+texture Current_BackBuffer_Tex  { Width = BUFFER_WIDTH; Height = BUFFER_HEIGHT; Format = RGB10A2; }; 
 
 sampler CBackBuffer
 	{
@@ -127,7 +128,7 @@ sampler CBackBuffer
 		MipFilter = POINT;
 	};
 
-texture PastSingleBackBuffer  { Width = BUFFER_WIDTH; Height = BUFFER_HEIGHT; Format = RGBA8;}; 
+texture PastSingleBackBuffer  { Width = BUFFER_WIDTH; Height = BUFFER_HEIGHT; Format = RGB10A2;}; 
 sampler PSBackBuffer
 	{
 		Texture = PastSingleBackBuffer;
@@ -147,15 +148,14 @@ float fmod(float a, float b)
 }
 
 //Stereo Texture grabber
+// OPT: eliminated redundant second tex2Dlod call — AdaptColor was sampling the same
+// coords as Color. Alpha (luminance envelope) computed from the single sample instead.
 float4 BB_Texture(float2 TC)
 {
 	if(Stereoscopic_Mode_Input == 1)
 		TC.y = SbS_Half_Full ? TC.y * 0.5 + 0.25 : TC.y;
-	float4 Color = tex2Dlod(BackBuffer, float4(TC,0,0) ), Exp_Darks, Exp_Brights;
-	        	 
-	float3 AdaptColor = tex2Dlod(BackBuffer, float4(TC,0,0) ).rgb;
-	
-    return float4(Color.rgb,max(AdaptColor.r, max(AdaptColor.g, AdaptColor.b)));
+	float4 Color = tex2Dlod(BackBuffer, float4(TC,0,0));
+	return float4(Color.rgb, max(Color.r, max(Color.g, Color.b)));
 }
 
 //Unilinear Left / Right
@@ -206,7 +206,7 @@ float4 Bi_LR(in float2 texcoord,in int Switcher )
 
 void PS_InputLR(in float4 position : SV_Position, in float2 texcoord : TEXCOORD0, out float4 colorA : SV_Target0 , out float4 colorB: SV_Target1)
 {	
-float4 Left, Right;
+float4 Left = 0, Right = 0; // initialised: safe output when mode is Off
 	float P = Perspective * pix.x;
 			
 	if(Stereoscopic_Mode_Input == 1) //SbS
@@ -229,17 +229,22 @@ float4 Left, Right;
 		Left =  Bi_LR(float2(texcoord.x + P,texcoord.y), 0);
 		Right = Bi_LR(float2(texcoord.x - P,texcoord.y), 1);
 	}
-	if(Stereoscopic_Mode_Input == 5) //Frame Sequential Conversion.
+	// OPT: Frame Sequential path rewritten to avoid two wasted PSBackBuffer samples.
+	// Original code sampled PSBackBuffer for both L and R then overwrote one unconditionally.
+	// Now we only sample what we actually need for this frame's parity.
+	else if(Stereoscopic_Mode_Input == 5) //Frame Sequential Conversion.
 	{
-		float OddEven = framecount % 2 == 0;
-		//Past Single Frame
-		Left = tex2D(PSBackBuffer,float2(texcoord.x + P,texcoord.y));
-		Right = tex2D(PSBackBuffer,float2(texcoord.x - P,texcoord.y));
-		//Current Single Frame
+		bool OddEven = (framecount % 2) == 0;
 		if (OddEven)
-			Left =  BB_Texture(float2(texcoord.x+P,texcoord.y));
+		{
+			Left  = BB_Texture(float2(texcoord.x + P, texcoord.y));        // current = left
+			Right = tex2D(PSBackBuffer, float2(texcoord.x - P, texcoord.y)); // past    = right
+		}
 		else
-			Right = BB_Texture(float2(texcoord.x-P,texcoord.y));
+		{
+			Left  = tex2D(PSBackBuffer, float2(texcoord.x + P, texcoord.y)); // past    = left
+			Right = BB_Texture(float2(texcoord.x - P, texcoord.y));          // current = right
+		}
 	}
 
 	
@@ -256,8 +261,8 @@ void PS_InputKata(in float4 position : SV_Position, in float2 texcoord : TEXCOOR
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 float4 toElse(float2 texcoord)
 {
-	float4 image = 1, cL, cR, L, R, Out, accum;
-	float2 TCL, TCR, StoreTC = texcoord;
+	float4 image = 1, cL, cR, Out, accum;
+	float2 TCL, TCR;
 	float P = 0;//Perspective * pix.x;
 
 	if (Stereoscopic_Mode == 0)
@@ -305,25 +310,28 @@ float4 toElse(float2 texcoord)
             cR = tex2D(SamplerCL,float2(TCR.x,TCR.y));
 		}
 
-	float2 gridxy;
-
-	if(Scaling_Support == 0)
-		gridxy = floor(float2(texcoord.x*3840.0,texcoord.y*2160.0));	
-	else if(Scaling_Support == 1)
-		gridxy = floor(float2(texcoord.x*BUFFER_WIDTH,texcoord.y*BUFFER_HEIGHT));
-	else if(Scaling_Support == 2)
-		gridxy = floor(float2((texcoord.x*1920.0)*0.5,(texcoord.y*1080.0)*0.5));
-	else if(Scaling_Support == 3)
-		gridxy = floor(float2((texcoord.x*1921.0)*0.5,(texcoord.y*1081.0)*0.5));
-	else if(Scaling_Support == 4)
-		gridxy = floor(float2((texcoord.x*1680.0)*0.5,(texcoord.y*1050.0)*0.5));
-	else if(Scaling_Support == 5)
-		gridxy = floor(float2((texcoord.x*1681.0)*0.5,(texcoord.y*1051.0)*0.5));
-	else if(Scaling_Support == 6)
-		gridxy = floor(float2((texcoord.x*1280.0)*0.5,(texcoord.y*720.0)*0.5));
-	else if(Scaling_Support == 7)
-		gridxy = floor(float2((texcoord.x*1281.0)*0.5,(texcoord.y*721.0)*0.5));
-
+	// OPT: gridxy only needed for interlaced/checkerboard modes (2,3,4).
+	// Skipped for SBS (0), TnB (1), and Anaglyph (5) — saves 8-way if chain + floor() per pixel.
+	float2 gridxy = 0;
+	if (Stereoscopic_Mode >= 2 && Stereoscopic_Mode <= 4)
+	{
+		if(Scaling_Support == 0)
+			gridxy = floor(float2(texcoord.x*3840.0,texcoord.y*2160.0));	
+		else if(Scaling_Support == 1)
+			gridxy = floor(float2(texcoord.x*BUFFER_WIDTH,texcoord.y*BUFFER_HEIGHT));
+		else if(Scaling_Support == 2)
+			gridxy = floor(float2((texcoord.x*1920.0)*0.5,(texcoord.y*1080.0)*0.5));
+		else if(Scaling_Support == 3)
+			gridxy = floor(float2((texcoord.x*1921.0)*0.5,(texcoord.y*1081.0)*0.5));
+		else if(Scaling_Support == 4)
+			gridxy = floor(float2((texcoord.x*1680.0)*0.5,(texcoord.y*1050.0)*0.5));
+		else if(Scaling_Support == 5)
+			gridxy = floor(float2((texcoord.x*1681.0)*0.5,(texcoord.y*1051.0)*0.5));
+		else if(Scaling_Support == 6)
+			gridxy = floor(float2((texcoord.x*1280.0)*0.5,(texcoord.y*720.0)*0.5));
+		else if(Scaling_Support == 7)
+			gridxy = floor(float2((texcoord.x*1281.0)*0.5,(texcoord.y*721.0)*0.5));
+	}
 			
 	if(Stereoscopic_Mode == 0)	
 		Out = texcoord.x < 0.5 ? cL : cR;
@@ -336,7 +344,7 @@ float4 toElse(float2 texcoord)
 	else if(Stereoscopic_Mode == 4)	
 		Out = fmod(gridxy.x+gridxy.y,2.0) ? cR : cL;
 	else if(Stereoscopic_Mode == 5)
-	{													
+	{								
 		float Contrast = 1.0, DeGhost = 0.06, LOne, ROne;
 			float3 HalfLA = dot(cL.rgb,float3(0.299, 0.587, 0.114));
 			float3 HalfRA = dot(cR.rgb,float3(0.299, 0.587, 0.114));
@@ -466,7 +474,8 @@ float4 toElse(float2 texcoord)
 
 void Current_BackBuffer(float4 position : SV_Position, float2 texcoord : TEXCOORD, out float4 color : SV_Target)
 {	 	
-	color = BB_Texture(texcoord);
+	// Direct copy — avoids BB_Texture mode checks for a plain backbuffer copy.
+	color = float4(tex2Dlod(BackBuffer, float4(texcoord, 0, 0)).rgb, 1.0);
 }
 
 void Past_BackBuffer(float4 position : SV_Position, float2 texcoord : TEXCOORD, out float4 PastSingle : SV_Target0)
@@ -493,33 +502,33 @@ void PostProcessVS(in uint id : SV_VertexID, out float4 position : SV_Position, 
 technique To_Else
 {		
 			pass PBB
-		{
-			VertexShader = PostProcessVS;
-			PixelShader = Past_BackBuffer;
-			RenderTarget = PastSingleBackBuffer;
-		}
+			{
+				VertexShader = PostProcessVS;
+				PixelShader = Past_BackBuffer;
+				RenderTarget = PastSingleBackBuffer;
+			}
 			pass CBB
-		{
-			VertexShader = PostProcessVS;
-			PixelShader = Current_BackBuffer;
-			RenderTarget = Current_BackBuffer_Tex;
-		}
+			{
+				VertexShader = PostProcessVS;
+				PixelShader = Current_BackBuffer;
+				RenderTarget = Current_BackBuffer_Tex;
+			}
 			pass StereoInput
-		{
-			VertexShader = PostProcessVS;
-			PixelShader = PS_InputLR;
-			RenderTarget0 = texCL;
-			RenderTarget1 = texCR;
-		}
+			{
+				VertexShader = PostProcessVS;
+				PixelShader = PS_InputLR;
+				RenderTarget0 = texCL;
+				RenderTarget1 = texCR;
+			}
 			pass StereoToKata
-		{
-			VertexShader = PostProcessVS;
-			PixelShader = PS_InputKata;
-			RenderTarget = texTOT;
-		}
+			{
+				VertexShader = PostProcessVS;
+				PixelShader = PS_InputKata;
+				RenderTarget = texTOT;
+			}
 			pass StereoToElse
-		{
-			VertexShader = PostProcessVS;
-			PixelShader = Out;	
-		}		
+			{
+				VertexShader = PostProcessVS;
+				PixelShader = Out;	
+			}		
 }

@@ -6,12 +6,8 @@
 #include <d3d11.h>
 #include <d3d11_1.h>   // ID3D11Device1 for OpenSharedResource1
 #include <d3d12.h>
-#include <cstdio>
-#include <iostream>
-#include <cstdint>
-#include <array>
-#include <sstream>
-#include <vector>
+#include <cstdio>    // snprintf
+#include <cstdint>   // uint32_t etc.
 
 // Vulkan support is optional — only compiled when the Vulkan SDK is present.
 // build.bat passes /DSUPVR_VULKAN=1 when VULKAN_SDK env var is set.
@@ -36,7 +32,6 @@ typedef struct { int sType; void* pNext; int imageType; VkFormat format; VkExten
                  uint32_t mipLevels, arrayLayers, samples, tiling, usage, sharingMode;
                  uint32_t queueFamilyIndexCount; const uint32_t* pQueueFamilyIndices; int initialLayout; } VkImageCreateInfo;
 typedef struct { int sType; void* pNext; uint32_t handleType; HANDLE handle; LPCWSTR name; } VkImportMemoryWin32HandleInfoKHR;
-typedef struct { int sType; VkDeviceMemory memory; uint32_t handleType; } VkMemoryGetWin32HandleInfoKHR;
 typedef VkResult(VKAPI_PTR* PFN_vkGetDeviceProcAddr)(VkDevice, const char*);
 typedef VkResult(VKAPI_PTR* PFN_vkCreateImage)(VkDevice, const VkImageCreateInfo*, void*, VkImage*);
 typedef void    (VKAPI_PTR* PFN_vkDestroyImage)(VkDevice, VkImage, void*);
@@ -44,12 +39,10 @@ typedef void    (VKAPI_PTR* PFN_vkGetImageMemoryRequirements)(VkDevice, VkImage,
 typedef VkResult(VKAPI_PTR* PFN_vkAllocateMemory)(VkDevice, const VkMemoryAllocateInfo*, void*, VkDeviceMemory*);
 typedef void    (VKAPI_PTR* PFN_vkFreeMemory)(VkDevice, VkDeviceMemory, void*);
 typedef VkResult(VKAPI_PTR* PFN_vkBindImageMemory)(VkDevice, VkImage, VkDeviceMemory, uint64_t);
-typedef VkResult(VKAPI_PTR* PFN_vkGetMemoryWin32HandleKHR_stub)(VkDevice, const VkMemoryGetWin32HandleInfoKHR*, HANDLE*);
 #define VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO                      14
 #define VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO                    5
 #define VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO 1000072001
 #define VK_STRUCTURE_TYPE_IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR 1000073000
-#define VK_STRUCTURE_TYPE_MEMORY_GET_WIN32_HANDLE_INFO_KHR    1000073003
 #define VK_IMAGE_TYPE_2D                             1
 #define VK_SAMPLE_COUNT_1_BIT                        1
 #define VK_IMAGE_TILING_OPTIMAL                      1
@@ -57,7 +50,8 @@ typedef VkResult(VKAPI_PTR* PFN_vkGetMemoryWin32HandleKHR_stub)(VkDevice, const 
 #define VK_IMAGE_USAGE_SAMPLED_BIT                   4
 #define VK_SHARING_MODE_EXCLUSIVE                    0
 #define VK_IMAGE_LAYOUT_UNDEFINED                    0
-#define VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT 0x00000800
+// VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT (0x800) = NT handle — not used.
+// We use D3D11_TEXTURE_KMT_BIT (0x400) via VK_EXT_MEM_KMT defined in share_vulkan.
 #define VK_FORMAT_R8G8B8A8_UNORM                    37
 #define VK_FORMAT_B8G8R8A8_UNORM                    44
 #define VK_FORMAT_A2B10G10R10_UNORM_PACK32          64
@@ -65,6 +59,7 @@ typedef VkResult(VKAPI_PTR* PFN_vkGetMemoryWin32HandleKHR_stub)(VkDevice, const 
 #define VK_FORMAT_R16G16B16A16_UNORM                91
 #define VK_FORMAT_B10G11R11_UFLOAT_PACK32          122
 #define VK_FORMAT_R32G32B32A32_SFLOAT              109
+#define VK_EXT_MEM_KMT                    0x00000400u // D3D11 KMT handle type for Vulkan import
 #endif
 #include <GL/gl.h>
 
@@ -116,7 +111,6 @@ static PFN_wglDXUnlockObjectsNV    s_wglDXUnlockObjectsNV    = nullptr;
 
 // GL extended types not in GL/gl.h on Windows (only GL 1.1 is in the system header).
 typedef unsigned long long GLuint64;
-typedef          long long GLint64;
 #ifndef GL_SIZEIPTR_TYPE
 typedef SIZE_T GLsizeiptr;
 #endif
@@ -155,9 +149,6 @@ static PFN_glUnmapBuffer   s_glUnmapBuffer   = nullptr;
 #ifndef GL_READ_ONLY
 #define GL_READ_ONLY                    0x88B8
 #endif
-#ifndef GL_HANDLE_TYPE_D3D11_IMAGE_EXT
-#define GL_HANDLE_TYPE_D3D11_IMAGE_EXT     0x958B
-#endif
 #ifndef GL_HANDLE_TYPE_D3D11_IMAGE_KMT_EXT
 #define GL_HANDLE_TYPE_D3D11_IMAGE_KMT_EXT 0x958C
 #endif
@@ -178,13 +169,6 @@ static PFN_vkGetImageMemoryRequirements s_vkGetImageMemoryRequirements = nullptr
 static PFN_vkAllocateMemory             s_vkAllocateMemory             = nullptr;
 static PFN_vkFreeMemory                 s_vkFreeMemory                 = nullptr;
 static PFN_vkBindImageMemory            s_vkBindImageMemory            = nullptr;
-#if SUPVR_VULKAN
-typedef VkResult(VKAPI_PTR* PFN_vkGetMemoryWin32HandleKHR_t)(VkDevice, const VkMemoryGetWin32HandleInfoKHR*, HANDLE*);
-#else
-typedef PFN_vkGetMemoryWin32HandleKHR_stub PFN_vkGetMemoryWin32HandleKHR_t;
-#endif
-static PFN_vkGetMemoryWin32HandleKHR_t  s_vkGetMemoryWin32Handle       = nullptr;
-
 static VkDevice       g_vk_device        = nullptr;
 static VkImage        g_vk_image         = VK_NULL_HANDLE;
 static VkDeviceMemory g_vk_memory        = VK_NULL_HANDLE;
@@ -234,14 +218,13 @@ static reshade::api::format g_src_format = SRC_FORMAT_UNSET;
 
 // ── FA / uniform state ────────────────────────────────────────────────────────
 static reshade::api::effect_runtime*         g_active_runtime     = nullptr;
-static uint32_t g_frame_counter    = 0;
-static bool     g_fa_active        = true;
-static bool     g_prev_key_state   = false;
 static bool     g_reload_attempted = false;
 static uint32_t g_reload_count     = 0;   // total reloads fired this session
 static bool     g_vr_ready           = false; // true once DoubleTex + FA found successfully
-static bool     g_d3d12_fmt_mismatch = false; // source fmt != shared fmt, copy skipped
 static bool     g_copy_logged         = false; // log first copy once per setup
+static reshade::api::resource    g_cached_src_res  = { 0 }; // cached copy-src resource handle
+static reshade::api::device_api  g_cached_api = reshade::api::device_api::d3d12; // cached API
+static uint32_t                  g_acquiresync_fail_count = 0; // consecutive AcquireSync failures
 
 // ── Format helpers ────────────────────────────────────────────────────────────
 
@@ -435,8 +418,9 @@ static void release_shared(reshade::api::device_api api)
         sharedTexture_D3D11 = nullptr;
     }
     sharedTexture = nullptr;
-    g_d3d12_fmt_mismatch = false;
-    g_copy_logged        = false;
+    g_copy_logged            = false;
+    g_acquiresync_fail_count = 0;
+    g_cached_src_res         = { 0 };
 }
 
 // Create D3D11 shared texture: gets legacy handle for KatanaVR + NT handle for GPU import
@@ -472,10 +456,11 @@ static ID3D11Texture2D* create_d3d11_shared(
     }
 
     // No IDXGIKeyedMutex (incompatible with SHARED flag).
-    // Release previous D3D11 tex before overwriting.
+    // Callers call release_shared before create_d3d11_shared, so these are normally
+    // already null. The checks here guard against direct calls (e.g. Vulkan/OpenGL paths).
     if (sharedTextureMutex)  { sharedTextureMutex->Release();  sharedTextureMutex  = nullptr; }
     if (sharedTexture_D3D11) { static_cast<ID3D11Texture2D*>(sharedTexture_D3D11)->Release(); sharedTexture_D3D11 = nullptr; }
-    sharedTextureMutex  = nullptr; // no keyed mutex
+    sharedTextureMutex  = nullptr; // no keyed mutex with SHARED flag
     sharedTexture_D3D11 = tex;
     return tex;
 }
@@ -522,9 +507,10 @@ static void share_d3d11(ID3D11Texture2D* src, ID3D11Device* dev,
 {
     release_shared(api);
     D3D11_TEXTURE2D_DESC d; src->GetDesc(&d);
-    d.BindFlags |= D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    d.BindFlags    = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
     d.CPUAccessFlags = 0;
-    d.MiscFlags = D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
+    d.Usage        = D3D11_USAGE_DEFAULT; // source may be DYNAMIC; shared tex must be DEFAULT
+    d.MiscFlags    = D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
     d.Format = dxgi_ensure_typed(d.Format);
 
     ID3D11Texture2D* shared = nullptr;
@@ -535,7 +521,7 @@ static void share_d3d11(ID3D11Texture2D* src, ID3D11Device* dev,
     shared->QueryInterface(__uuidof(IDXGIKeyedMutex), reinterpret_cast<void**>(&mutex));
     IDXGIResource* r = nullptr; HANDLE leg = nullptr;
     if (SUCCEEDED(shared->QueryInterface(IID_PPV_ARGS(&r)))) { r->GetSharedHandle(&leg); r->Release(); }
-    if (!leg) { shared->Release(); if (mutex) mutex->Release(); return; }
+    if (!leg) { shared->Release(); if (mutex) mutex->Release(); LOG_ERR("SuperVrExport: D3D11 GetSharedHandle failed"); return; }
 
     write_katanga_handle(leg);
     sharedTextureMutex  = mutex;
@@ -548,9 +534,10 @@ static void share_d3d10(ID3D10Texture2D* src, ID3D10Device* dev)
 {
     release_shared(reshade::api::device_api::d3d10);
     D3D10_TEXTURE2D_DESC d; src->GetDesc(&d);
-    d.BindFlags |= D3D10_BIND_RENDER_TARGET | D3D10_BIND_SHADER_RESOURCE;
+    d.BindFlags    = D3D10_BIND_RENDER_TARGET | D3D10_BIND_SHADER_RESOURCE;
     d.CPUAccessFlags = 0;
-    d.MiscFlags = D3D10_RESOURCE_MISC_SHARED_KEYEDMUTEX;
+    d.Usage        = D3D10_USAGE_DEFAULT;
+    d.MiscFlags    = D3D10_RESOURCE_MISC_SHARED_KEYEDMUTEX;
 
     ID3D10Texture2D* shared = nullptr;
     if (FAILED(dev->CreateTexture2D(&d, nullptr, &shared))) {
@@ -560,7 +547,7 @@ static void share_d3d10(ID3D10Texture2D* src, ID3D10Device* dev)
     shared->QueryInterface(__uuidof(IDXGIKeyedMutex), reinterpret_cast<void**>(&mutex));
     IDXGIResource* r = nullptr; HANDLE leg = nullptr;
     if (SUCCEEDED(shared->QueryInterface(IID_PPV_ARGS(&r)))) { r->GetSharedHandle(&leg); r->Release(); }
-    if (!leg) { shared->Release(); if (mutex) mutex->Release(); return; }
+    if (!leg) { shared->Release(); if (mutex) mutex->Release(); LOG_ERR("SuperVrExport: D3D10 GetSharedHandle failed"); return; }
 
     write_katanga_handle(leg);
     sharedTextureMutex  = mutex;
@@ -584,7 +571,7 @@ static void share_d3d9(IDirect3DTexture9* src, IDirect3DDevice9* dev)
     HRESULT hr = devEx->CreateTexture(d.Width, d.Height, 1,
         D3DUSAGE_RENDERTARGET, d.Format, D3DPOOL_DEFAULT, &s9, &h9);
     devEx->Release();
-    if (FAILED(hr) || !h9) { if (s9) s9->Release(); return; }
+    if (FAILED(hr) || !h9) { if (s9) s9->Release(); LOG_ERR("SuperVrExport: D3D9 CreateTexture failed"); return; }
 
     // Open s9 on D3D11 for KatanaVR — same GPU memory.
     if (!open_on_d3d11(h9, false)) {
@@ -602,8 +589,6 @@ static void share_d3d9(IDirect3DTexture9* src, IDirect3DDevice9* dev)
 static void share_d3d12(ID3D12Resource* src, ID3D12Device* dev)
 {
     release_shared(reshade::api::device_api::d3d12);
-    g_d3d12_fmt_mismatch = false;
-
     // Reversed bridge: create D3D11 shared tex → open as D3D12 copy dst on the GAME device.
     // This avoids D3D12_HEAP_FLAG_SHARED which RE Engine (and many D3D12 games) block entirely.
     // VRScreenCap reads via its D3D11 path using the legacy KMT handle we write to KatangaMappedFile.
@@ -651,17 +636,16 @@ static void share_vulkan(reshade::api::resource src_res, reshade::api::device* d
     DXGI_FORMAT dxgi_fmt = reshade_to_dxgi(desc.texture.format);
     VkFormat vk_fmt = dxgi_to_vkformat(dxgi_fmt);
 
-    // FIX: re-create if resolution changed
+    VkDevice vk_dev = reinterpret_cast<VkDevice>(static_cast<uintptr_t>(dev->get_native()));
+    // Re-create if resolution changed (uses old g_vk_device for cleanup, then updates).
     if (g_vk_image != VK_NULL_HANDLE && (g_vk_width != w || g_vk_height != h)) {
         if (s_vkDestroyImage) s_vkDestroyImage(g_vk_device, g_vk_image, nullptr);
         if (s_vkFreeMemory)   s_vkFreeMemory  (g_vk_device, g_vk_memory, nullptr);
         g_vk_image = VK_NULL_HANDLE; g_vk_memory = VK_NULL_HANDLE;
         release_shared(reshade::api::device_api::vulkan);
     }
-    if (g_vk_image != VK_NULL_HANDLE) return;
-
-    VkDevice vk_dev = reinterpret_cast<VkDevice>(static_cast<uintptr_t>(dev->get_native()));
-    g_vk_device = vk_dev;
+    if (g_vk_image != VK_NULL_HANDLE) return; // already set up at same resolution
+    g_vk_device = vk_dev; // update device after confirming we will proceed
 
     HMODULE vk_dll = GetModuleHandleA("vulkan-1.dll");
     if (!vk_dll) return;
@@ -669,15 +653,15 @@ static void share_vulkan(reshade::api::resource src_res, reshade::api::device* d
         GetProcAddress(vk_dll, "vkGetDeviceProcAddr"));
     if (!vkGetDevProc) return;
 
+    // Only load VK function pointers on first setup or if device changed.
+    if (!s_vkCreateImage) {
 #define LOAD_VK(fn) s_##fn = reinterpret_cast<PFN_##fn>(vkGetDevProc(vk_dev, #fn)); \
-                    if (!s_##fn) { LOG_ERR("SuperVrExport: Vulkan missing " #fn); return; }
-    LOAD_VK(vkCreateImage) LOAD_VK(vkDestroyImage)
-    LOAD_VK(vkGetImageMemoryRequirements)
-    LOAD_VK(vkAllocateMemory) LOAD_VK(vkFreeMemory) LOAD_VK(vkBindImageMemory)
+                        if (!s_##fn) { LOG_ERR("SuperVrExport: Vulkan missing " #fn); return; }
+        LOAD_VK(vkCreateImage) LOAD_VK(vkDestroyImage)
+        LOAD_VK(vkGetImageMemoryRequirements)
+        LOAD_VK(vkAllocateMemory) LOAD_VK(vkFreeMemory) LOAD_VK(vkBindImageMemory)
 #undef LOAD_VK
-    s_vkGetMemoryWin32Handle = reinterpret_cast<PFN_vkGetMemoryWin32HandleKHR_t>(
-        vkGetDevProc(vk_dev, "vkGetMemoryWin32HandleKHR"));
-
+    }
     // Create D3D11 shared texture first (we control it), get NT handle for Vulkan import.
     HANDLE nt = nullptr;
     ID3D11Texture2D* d11 = create_d3d11_shared(w, h, dxgi_fmt, &nt);
@@ -685,12 +669,12 @@ static void share_vulkan(reshade::api::resource src_res, reshade::api::device* d
 
     VkImportMemoryWin32HandleInfoKHR imp = {};
     imp.sType      = VK_STRUCTURE_TYPE_IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR;
-    imp.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT;
+    imp.handleType = VK_EXT_MEM_KMT;
     imp.handle     = nt;
 
     VkExternalMemoryImageCreateInfo ext = {};
     ext.sType       = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
-    ext.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT;
+    ext.handleTypes = VK_EXT_MEM_KMT;
 
     VkImageCreateInfo ic = {};
     ic.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO; ic.pNext = &ext;
@@ -703,14 +687,16 @@ static void share_vulkan(reshade::api::resource src_res, reshade::api::device* d
 
     VkImage img = VK_NULL_HANDLE;
     if (s_vkCreateImage(vk_dev, &ic, nullptr, &img) != VK_SUCCESS) {
-        CloseHandle(nt); return;
+        return; // nt is a KMT handle — do NOT CloseHandle on KMT handles
     }
     VkMemoryRequirements mr = {};
     s_vkGetImageMemoryRequirements(vk_dev, img, &mr);
 
-    // FIX: iterate all 32 memory type indices — no VkPhysicalDevice needed
+    // Iterate valid memory type indices using memoryTypeBits — skips unsupported types.
+    // This avoids up to 32 failed vkAllocateMemory calls on each setup.
     VkDeviceMemory mem = VK_NULL_HANDLE;
     for (uint32_t i = 0; i < 32; ++i) {
+        if (!((mr.memoryTypeBits >> i) & 1u)) continue; // type not supported for this image
         VkMemoryAllocateInfo ai = {};
         ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
         ai.pNext = &imp; ai.allocationSize = mr.size; ai.memoryTypeIndex = i;
@@ -719,13 +705,14 @@ static void share_vulkan(reshade::api::resource src_res, reshade::api::device* d
     }
     if (!mem) {
         LOG_ERR("SuperVrExport: Vulkan vkAllocateMemory failed all types");
-        s_vkDestroyImage(vk_dev, img, nullptr); CloseHandle(nt); return;
+        s_vkDestroyImage(vk_dev, img, nullptr); return; // nt = KMT handle, no CloseHandle
     }
-    CloseHandle(nt);
+    // nt is a KMT handle from D3D11_RESOURCE_MISC_SHARED — do NOT CloseHandle.
 
     if (s_vkBindImageMemory(vk_dev, img, mem, 0) != VK_SUCCESS) {
         s_vkFreeMemory(vk_dev, mem, nullptr);
-        s_vkDestroyImage(vk_dev, img, nullptr); return;
+        s_vkDestroyImage(vk_dev, img, nullptr);
+        LOG_ERR("SuperVrExport: Vulkan vkBindImageMemory failed"); return;
     }
     g_vk_image = img; g_vk_memory = mem;
     g_vk_width = w;   g_vk_height = h;
@@ -800,14 +787,11 @@ static void share_opengl(GLuint gl_tex, reshade::api::resource src_res,
             default:                              bpp = 4;  break;
             }
             GLuint64 mem_sz = (GLuint64)w * h * bpp;
-            // Try NT handle first, fall back to legacy KMT handle
-            s_glImportMemoryWin32HandleEXT(mem_obj, mem_sz, GL_HANDLE_TYPE_D3D11_IMAGE_EXT, nt);
-            if (glGetError() != GL_NO_ERROR) {
-                IDXGIResource* r = nullptr; HANDLE kmt = nullptr;
-                if (SUCCEEDED(d11->QueryInterface(IID_PPV_ARGS(&r)))) { r->GetSharedHandle(&kmt); r->Release(); }
-                if (kmt) s_glImportMemoryWin32HandleEXT(mem_obj, mem_sz, GL_HANDLE_TYPE_D3D11_IMAGE_KMT_EXT, kmt);
-            }
-            CloseHandle(nt);
+            // create_d3d11_shared uses SHARED flag → KMT handle.
+            // Use GL_HANDLE_TYPE_D3D11_IMAGE_KMT_EXT directly — no NT fallback needed.
+            // nt is a KMT handle — do NOT CloseHandle.
+            s_glImportMemoryWin32HandleEXT(mem_obj, mem_sz, GL_HANDLE_TYPE_D3D11_IMAGE_KMT_EXT, nt);
+            glGetError(); // clear any import error before checking storage result
             s_glTextureStorageMem2DEXT(gl_tex, 1, glf.internal, (GLsizei)w, (GLsizei)h, mem_obj, 0);
             if (glGetError() == GL_NO_ERROR) {
                 g_gl_mem_obj    = mem_obj;
@@ -820,7 +804,7 @@ static void share_opengl(GLuint gl_tex, reshade::api::resource src_res,
             // Fall through to next path
         }
         if (d11) d11->Release();
-        if (nt)  CloseHandle(nt);
+        // nt = KMT handle — no CloseHandle
     }
 
     // ── Path 2: WGL_NV_DX_interop2 (NVIDIA legacy, GPU-direct) ─────────────
@@ -906,7 +890,7 @@ static void opengl_pbo_copy(GLuint gl_tex, reshade::api::device* dev,
         if (ptr) {
             D3D11_BOX box = {0,0,0,w,h,1};
             bool pbo_mutex_ok = true;
-            if (sharedTextureMutex) pbo_mutex_ok = SUCCEEDED(sharedTextureMutex->AcquireSync(0, 50));
+            if (sharedTextureMutex) pbo_mutex_ok = SUCCEEDED(sharedTextureMutex->AcquireSync(0, 0)); // 0ms: non-blocking
             if (pbo_mutex_ok) {
                 g_d3d11_context->UpdateSubresource(
                     static_cast<ID3D11Texture2D*>(sharedTexture), 0, &box,
@@ -924,6 +908,7 @@ static void opengl_pbo_copy(GLuint gl_tex, reshade::api::device* dev,
 reshade::api::effect_texture_variable get_vr_texture(reshade::api::effect_runtime* rt)
 {
     if (g_cached_vr_tex.handle != 0 && !g_tex_cache_dirty) return g_cached_vr_tex;
+    g_cached_src_res = { 0 }; // texture changed — resource handle must be re-queried
     // Use nullptr effect name to search ALL effects regardless of how ReShade stores the path.
     auto v = rt->find_texture_variable(nullptr, "V__texTOT");
     if (v.handle == 0) v = rt->find_texture_variable(nullptr, "V__SuperDepth3D__DoubleTex");
@@ -1001,10 +986,14 @@ void add_copy_command(reshade::api::effect_runtime* rt,
     if (rt != g_active_runtime) return; // skip secondary runtimes
     auto vt = get_vr_texture(rt);
     if (vt.handle == 0) return;
-    auto src = get_texture_resource(rt, vt);
+    // Use cached resource handle — avoids 2 virtual calls (get_texture_binding + get_resource_from_view) every frame.
+    // Invalidated by g_tex_cache_dirty whenever the texture variable changes.
+    if (!g_cached_src_res.handle)
+        g_cached_src_res = get_texture_resource(rt, vt);
+    auto src = g_cached_src_res;
     if (!src.handle || !sharedTexture) return;
 
-    auto api = rt->get_device()->get_api();
+    auto api = g_cached_api; // cached at init — avoids 2 virtual calls per frame
 
     // OpenGL: all three paths handled here — none fall through to copy_resource.
     if (api == reshade::api::device_api::opengl) {
@@ -1029,13 +1018,24 @@ void add_copy_command(reshade::api::effect_runtime* rt,
     cs_enter();
     bool mutex_acquired = true;
     if (sharedTextureMutex) {
-        HRESULT hr_sync = sharedTextureMutex->AcquireSync(0, 50);
+        HRESULT hr_sync = sharedTextureMutex->AcquireSync(0, 0); // 0ms: non-blocking
         mutex_acquired = SUCCEEDED(hr_sync);
-        if (!mutex_acquired) LOG_ERR("SuperVrExport: AcquireSync timed out, skipping copy");
+        if (!mutex_acquired) {
+            // Only log first failure per burst to avoid spamming ReShade.log.
+            if (++g_acquiresync_fail_count == 1)
+                LOG_ERR("SuperVrExport: AcquireSync busy — skipping copy (suppressing further until resolved)");
+        } else {
+            g_acquiresync_fail_count = 0;
+        }
     }
     if (mutex_acquired) {
         rt->get_command_queue()->get_immediate_command_list()->copy_resource(src, dst);
-        rt->get_command_queue()->flush_immediate_command_list();
+        if (sharedTextureMutex) sharedTextureMutex->ReleaseSync(0);
+        cs_leave();
+        // Flush OUTSIDE the CS — D3D12/Vulkan (no keyed mutex) need GPU sync for VRScreenCap.
+        // D3D11/D3D10 use ReleaseSync above as their fence — no flush needed.
+        if (!sharedTextureMutex)
+            rt->get_command_queue()->flush_immediate_command_list();
         if (!g_copy_logged) {
             char buf[128]; snprintf(buf, sizeof(buf),
                 "SuperVrExport: first copy fired, src=0x%llX dst=0x%llX",
@@ -1043,9 +1043,9 @@ void add_copy_command(reshade::api::effect_runtime* rt,
             LOG_INF(buf);
             g_copy_logged = true;
         }
-        if (sharedTextureMutex) sharedTextureMutex->ReleaseSync(0);
+    } else {
+        cs_leave();
     }
-    cs_leave();
 
 }
 
@@ -1057,6 +1057,8 @@ static void on_init_runtime(reshade::api::effect_runtime* rt)
     // (g_vr_ready means we already found everything — don't reload again).
     if (!g_vr_ready) { g_reload_attempted = false; g_reload_count = 0; }
     g_tex_cache_dirty  = true;  // invalidate cache on new runtime (race-safe)
+    g_cached_src_res   = { 0 }; // invalidate cached resource handle
+    g_cached_api       = rt->get_device()->get_api(); // cache API — never changes per runtime
     // EX_DLP_FS_Mode=1: adds Frame Sequential (mode 6) to SuperDepth3D dropdown.
     rt->set_preprocessor_definition("EX_DLP_FS_Mode",   "1");
     // DoubleBuffer_Mode=1: creates DoubleTex as a direct SBS fallback.
@@ -1071,7 +1073,7 @@ static void on_reloaded_with_fa(reshade::api::effect_runtime* rt)
     // Clear sharedTexture on reload.
     cs_enter();
     if (sharedTexture) {
-        if (rt->get_device()->get_api() == reshade::api::device_api::opengl) {
+        if (g_cached_api == reshade::api::device_api::opengl) { // use cached — avoids 2 virtual calls
             if (g_gl_mem_obj && s_glDeleteMemoryObjectsEXT) {
                 s_glDeleteMemoryObjectsEXT(1, &g_gl_mem_obj); g_gl_mem_obj = 0;
             }
@@ -1085,7 +1087,7 @@ static void on_reloaded_with_fa(reshade::api::effect_runtime* rt)
             }
             g_gl_ext_active = false;
         }
-        release_shared(rt->get_device()->get_api());
+        release_shared(g_cached_api); // use cached — avoids 2 virtual calls
         g_src_width = 0; g_src_height = 0; g_src_format = SRC_FORMAT_UNSET;
     }
     cs_leave();
@@ -1106,9 +1108,10 @@ static void on_reloaded_with_fa(reshade::api::effect_runtime* rt)
         }
     }
 
-    apply_fa_state(rt, g_fa_active);
+    apply_fa_state(rt, true);
     export_effects(rt);
-    if (get_vr_texture(rt).handle != 0) {
+    // g_cached_vr_tex already populated by export_effects if found — no re-search needed.
+    if (g_cached_vr_tex.handle != 0) {
         g_vr_ready = true;
     }
 }
@@ -1175,7 +1178,7 @@ static void on_destroy_runtime(reshade::api::effect_runtime* rt)
     if (g_active_runtime == rt) {
         g_active_runtime = nullptr;
         cs_enter();
-        release_shared(rt->get_device()->get_api());
+        release_shared(g_cached_api); // use cached — avoids 2 virtual calls
         if (g_d3d9_shared_tex) { g_d3d9_shared_tex->Release(); g_d3d9_shared_tex = nullptr; }
         g_src_width = 0; g_src_height = 0; g_src_format = SRC_FORMAT_UNSET;
         g_vk_width  = 0; g_vk_height  = 0;
