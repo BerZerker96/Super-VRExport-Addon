@@ -122,6 +122,8 @@ Direct3D 9 games require an extra step because D3D9's shared texture support is 
 
 > Without dgVoodoo2 the addon will attempt a native D3D9 bridge path but this may fail or produce black frames depending on the game and driver. The D3D11 translation via dgVoodoo2 is the recommended and most reliable approach.
 
+> 📺 **Follow this tutorial for the dgVoodoo2 setup:** [dgVoodoo2 Setup Guide](https://www.youtube.com/watch?v=66shwiE3Jc8)
+
 ---
 
 ## 🌐 Geo3D / Frame Sequential Games
