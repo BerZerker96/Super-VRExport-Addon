@@ -221,8 +221,6 @@ static reshade::api::effect_runtime*         g_active_runtime     = nullptr;
 static bool     g_reload_attempted = false;
 static uint32_t g_reload_count     = 0;   // total reloads fired this session
 static bool     g_vr_ready           = false; // true once DoubleTex + FA found successfully
-static bool     g_copy_logged         = false; // log first copy once per setup
-static reshade::api::resource    g_cached_src_res  = { 0 }; // cached copy-src resource handle
 static reshade::api::device_api  g_cached_api = reshade::api::device_api::d3d12; // cached API
 static uint32_t                  g_acquiresync_fail_count = 0; // consecutive AcquireSync failures
 
@@ -335,7 +333,7 @@ static void apply_fa_state(reshade::api::effect_runtime* rt, bool on)
     }
 }
 
-static bool ensure_d3d11_device()
+static bool ensure_d3d11_device(IDXGIAdapter* adapter = nullptr)
 {
     if (g_d3d11_device) return true;
     // Load d3d11.dll directly to bypass ReShade's D3D11CreateDevice hook.
@@ -359,7 +357,8 @@ static bool ensure_d3d11_device()
     if (!pfn) return false;
     ID3D11Device* dev = nullptr; ID3D11DeviceContext* ctx = nullptr;
     D3D_FEATURE_LEVEL fl = D3D_FEATURE_LEVEL_11_0;
-    if (FAILED(pfn(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
+    D3D_DRIVER_TYPE dtype = adapter ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE;
+    if (FAILED(pfn(adapter, dtype, nullptr,
         0, &fl, 1, D3D11_SDK_VERSION, &dev, nullptr, &ctx))) return false;
     // Only assign if still unset (another thread may have raced us).
     if (InterlockedCompareExchangePointer(
@@ -378,13 +377,16 @@ static bool ensure_d3d11_device()
 // FIX: persistent file mapping — create once, update in-place
 static void write_katanga_handle(HANDLE h)
 {
-    if (!g_katanga_mapping) {
-        g_katanga_mapping = CreateFileMapping(INVALID_HANDLE_VALUE, nullptr,
-            PAGE_READWRITE, 0, sizeof(h), L"Local\\KatangaMappedFile");
-        if (!g_katanga_mapping) return;
-        g_katanga_view = reinterpret_cast<HANDLE*>(MapViewOfFile(
-            g_katanga_mapping, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(h)));
-    }
+    // Recreate mapping every call so KatanaVR detects the new handle.
+    // KatanaVR opens KatangaMappedFile by name — closing and recreating
+    // signals it to re-open and pick up the new D3D resource handle.
+    if (g_katanga_view)    { UnmapViewOfFile(g_katanga_view);  g_katanga_view    = nullptr; }
+    if (g_katanga_mapping) { CloseHandle(g_katanga_mapping);   g_katanga_mapping = nullptr; }
+    g_katanga_mapping = CreateFileMapping(INVALID_HANDLE_VALUE, nullptr,
+        PAGE_READWRITE, 0, sizeof(h), L"Local\\KatangaMappedFile");
+    if (!g_katanga_mapping) return;
+    g_katanga_view = reinterpret_cast<HANDLE*>(MapViewOfFile(
+        g_katanga_mapping, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(h)));
     if (g_katanga_view) *g_katanga_view = h;
 }
 
@@ -398,6 +400,8 @@ static void release_shared(reshade::api::device_api api)
     // Release the API-specific copy dst
     if (sharedTexture && sharedTexture != sharedTexture_D3D11) {
         switch (api) {
+        case reshade::api::device_api::d3d11:
+            static_cast<ID3D11Texture2D*>(sharedTexture)->Release(); break;
         case reshade::api::device_api::d3d12:
             static_cast<ID3D12Resource*>(sharedTexture)->Release(); break;
         case reshade::api::device_api::d3d10:
@@ -418,16 +422,15 @@ static void release_shared(reshade::api::device_api api)
         sharedTexture_D3D11 = nullptr;
     }
     sharedTexture = nullptr;
-    g_copy_logged            = false;
     g_acquiresync_fail_count = 0;
-    g_cached_src_res         = { 0 };
 }
 
 // Create D3D11 shared texture: gets legacy handle for KatanaVR + NT handle for GPU import
 static ID3D11Texture2D* create_d3d11_shared(
-    uint32_t w, uint32_t h, DXGI_FORMAT fmt, HANDLE* out_nt)
+    uint32_t w, uint32_t h, DXGI_FORMAT fmt, HANDLE* out_nt,
+    IDXGIAdapter* adapter = nullptr)
 {
-    if (!ensure_d3d11_device()) return nullptr;
+    if (!ensure_d3d11_device(adapter)) return nullptr;
     fmt = dxgi_ensure_typed(fmt);
 
     D3D11_TEXTURE2D_DESC d = {};
@@ -506,6 +509,7 @@ static void share_d3d11(ID3D11Texture2D* src, ID3D11Device* dev,
                          reshade::api::device_api api)
 {
     release_shared(api);
+
     D3D11_TEXTURE2D_DESC d; src->GetDesc(&d);
     d.BindFlags    = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
     d.CPUAccessFlags = 0;
@@ -513,6 +517,19 @@ static void share_d3d11(ID3D11Texture2D* src, ID3D11Device* dev,
     d.MiscFlags    = D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
     d.Format = dxgi_ensure_typed(d.Format);
 
+    // Unity: KEYEDMUTEX on game device crashes. Use standalone bridge.
+    if (GetModuleHandleA("UnityPlayer.dll")) {
+        HANDLE kmt = nullptr;
+        ID3D11Texture2D* standalone_tex = create_d3d11_shared(d.Width, d.Height, d.Format, &kmt);
+        if (!standalone_tex || !kmt) { LOG_ERR("SuperVrExport: Unity bridge: setup failed"); return; }
+        ID3D11Texture2D* game_side = nullptr;
+        if (FAILED(dev->OpenSharedResource(kmt, IID_PPV_ARGS(&game_side)))) {
+            LOG_ERR("SuperVrExport: Unity bridge: OpenSharedResource failed"); return;
+        }
+        sharedTexture = game_side;
+        LOG_INF("SuperVrExport: D3D11 ready (Unity standalone bridge)");
+        return;
+    }
     ID3D11Texture2D* shared = nullptr;
     if (FAILED(dev->CreateTexture2D(&d, nullptr, &shared))) {
         LOG_ERR("SuperVrExport: D3D11 CreateTexture2D failed"); return;
@@ -601,9 +618,17 @@ static void share_d3d12(ID3D12Resource* src, ID3D12Device* dev)
     // D3D11 supports sharing R10G10B10A2_UNORM and most other formats without issue.
     // Using the native format ensures copy_resource(D3D12_src → D3D12_from_D3D11_dst)
     // is a same-format copy — valid and produces correct colours in VRScreenCap.
+    // Use game D3D12 device's adapter for our standalone D3D11 device.
+    // Cross-adapter shared handles (e.g. integrated vs discrete GPU) produce black frames.
+    IDXGIDevice* dxgi_dev12 = nullptr;
+    IDXGIAdapter* game_adapter = nullptr;
+    if (SUCCEEDED(dev->QueryInterface(IID_PPV_ARGS(&dxgi_dev12)))) {
+        dxgi_dev12->GetAdapter(&game_adapter); dxgi_dev12->Release();
+    }
     HANDLE nt_for_d3d12 = nullptr;
     ID3D11Texture2D* d11 = create_d3d11_shared((UINT)rd.Width, (UINT)rd.Height,
-        src_fmt, &nt_for_d3d12);
+        src_fmt, &nt_for_d3d12, game_adapter);
+    if (game_adapter) { game_adapter->Release(); game_adapter = nullptr; }
     if (!d11) { LOG_ERR("SuperVrExport: D3D12 bridge: create_d3d11_shared failed"); return; }
     if (!nt_for_d3d12) { LOG_ERR("SuperVrExport: D3D12 bridge: KMT handle from D3D11 failed"); return; }
     LOG_INF("SuperVrExport: D3D12 bridge: got KMT handle, opening on game D3D12 device");
@@ -890,7 +915,7 @@ static void opengl_pbo_copy(GLuint gl_tex, reshade::api::device* dev,
         if (ptr) {
             D3D11_BOX box = {0,0,0,w,h,1};
             bool pbo_mutex_ok = true;
-            if (sharedTextureMutex) pbo_mutex_ok = SUCCEEDED(sharedTextureMutex->AcquireSync(0, 0)); // 0ms: non-blocking
+            if (sharedTextureMutex) pbo_mutex_ok = SUCCEEDED(sharedTextureMutex->AcquireSync(0, 50)); // 50ms: matches original
             if (pbo_mutex_ok) {
                 g_d3d11_context->UpdateSubresource(
                     static_cast<ID3D11Texture2D*>(sharedTexture), 0, &box,
@@ -908,7 +933,6 @@ static void opengl_pbo_copy(GLuint gl_tex, reshade::api::device* dev,
 reshade::api::effect_texture_variable get_vr_texture(reshade::api::effect_runtime* rt)
 {
     if (g_cached_vr_tex.handle != 0 && !g_tex_cache_dirty) return g_cached_vr_tex;
-    g_cached_src_res = { 0 }; // texture changed — resource handle must be re-queried
     // Use nullptr effect name to search ALL effects regardless of how ReShade stores the path.
     auto v = rt->find_texture_variable(nullptr, "V__texTOT");
     if (v.handle == 0) v = rt->find_texture_variable(nullptr, "V__SuperDepth3D__DoubleTex");
@@ -935,7 +959,7 @@ reshade::api::resource get_texture_resource(reshade::api::effect_runtime* rt,
 void export_effects(reshade::api::effect_runtime* rt)
 {
     auto vt = get_vr_texture(rt);
-    if (vt.handle == 0) { LOG_ERR("SuperVrExport: VR buffer not found"); return; }
+    if (vt.handle == 0) return;
     auto res = get_texture_resource(rt, vt);
     if (!res.handle) return;
     // Skip re-setup if already sharing (avoids breaking KatanaVR handle on every reload).
@@ -986,11 +1010,10 @@ void add_copy_command(reshade::api::effect_runtime* rt,
     if (rt != g_active_runtime) return; // skip secondary runtimes
     auto vt = get_vr_texture(rt);
     if (vt.handle == 0) return;
-    // Use cached resource handle — avoids 2 virtual calls (get_texture_binding + get_resource_from_view) every frame.
-    // Invalidated by g_tex_cache_dirty whenever the texture variable changes.
-    if (!g_cached_src_res.handle)
-        g_cached_src_res = get_texture_resource(rt, vt);
-    auto src = g_cached_src_res;
+    // Call get_texture_resource every frame — matches original addon.
+    // Caching was removed: a stale pointer from a recompile invalidating texTOT
+    // causes copy_resource to crash. The 2 virtual calls per frame are negligible.
+    auto src = get_texture_resource(rt, vt);
     if (!src.handle || !sharedTexture) return;
 
     auto api = g_cached_api; // cached at init — avoids 2 virtual calls per frame
@@ -1015,37 +1038,19 @@ void add_copy_command(reshade::api::effect_runtime* rt,
         ? static_cast<uint64_t>(g_vk_image)
         : uint64_t(sharedTexture);
 
-    cs_enter();
-    bool mutex_acquired = true;
-    if (sharedTextureMutex) {
-        HRESULT hr_sync = sharedTextureMutex->AcquireSync(0, 0); // 0ms: non-blocking
-        mutex_acquired = SUCCEEDED(hr_sync);
-        if (!mutex_acquired) {
-            // Only log first failure per burst to avoid spamming ReShade.log.
-            if (++g_acquiresync_fail_count == 1)
-                LOG_ERR("SuperVrExport: AcquireSync busy — skipping copy (suppressing further until resolved)");
-        } else {
-            g_acquiresync_fail_count = 0;
-        }
-    }
-    if (mutex_acquired) {
-        rt->get_command_queue()->get_immediate_command_list()->copy_resource(src, dst);
-        if (sharedTextureMutex) sharedTextureMutex->ReleaseSync(0);
-        cs_leave();
-        // Flush OUTSIDE the CS — D3D12/Vulkan (no keyed mutex) need GPU sync for VRScreenCap.
-        // D3D11/D3D10 use ReleaseSync above as their fence — no flush needed.
-        if (!sharedTextureMutex)
-            rt->get_command_queue()->flush_immediate_command_list();
-        if (!g_copy_logged) {
-            char buf[128]; snprintf(buf, sizeof(buf),
-                "SuperVrExport: first copy fired, src=0x%llX dst=0x%llX",
-                (unsigned long long)src.handle, (unsigned long long)dst.handle);
-            LOG_INF(buf);
-            g_copy_logged = true;
-        }
-    } else {
-        cs_leave();
-    }
+    // No CS here — matches original artumino addon. Both export_effects and
+    // add_copy_command fire on the render thread, so no cross-thread race on
+    // sharedTexture. The CS in export_effects protects setup; the per-frame
+    // copy path needs no lock.
+    if (sharedTextureMutex)
+        sharedTextureMutex->AcquireSync(0, 0); // 0ms: non-blocking
+
+    rt->get_command_queue()->get_immediate_command_list()->copy_resource(src, dst);
+    if (!sharedTextureMutex)
+        rt->get_command_queue()->flush_immediate_command_list();
+
+    if (sharedTextureMutex) sharedTextureMutex->ReleaseSync(0);
+
 
 }
 
@@ -1057,12 +1062,11 @@ static void on_init_runtime(reshade::api::effect_runtime* rt)
     // (g_vr_ready means we already found everything — don't reload again).
     if (!g_vr_ready) { g_reload_attempted = false; g_reload_count = 0; }
     g_tex_cache_dirty  = true;  // invalidate cache on new runtime (race-safe)
-    g_cached_src_res   = { 0 }; // invalidate cached resource handle
     g_cached_api       = rt->get_device()->get_api(); // cache API — never changes per runtime
-    // EX_DLP_FS_Mode=1: adds Frame Sequential (mode 6) to SuperDepth3D dropdown.
-    rt->set_preprocessor_definition("EX_DLP_FS_Mode",   "1");
-    // DoubleBuffer_Mode=1: creates DoubleTex as a direct SBS fallback.
-    rt->set_preprocessor_definition("DoubleBuffer_Mode", "1");
+    // Preprocessors are set in on_reloaded_with_fa only when texTOT is not found
+    // (i.e. SuperDepth3D pipeline needed). Setting them here causes an immediate
+    // SuperDepth3D recompile that destabilises 3DToElse texTOT on Geo3D games.
+    // Moved to: on_reloaded_with_fa DoubleTex-not-found path.
 }
 
 static void on_reloaded_with_fa(reshade::api::effect_runtime* rt)
@@ -1073,7 +1077,9 @@ static void on_reloaded_with_fa(reshade::api::effect_runtime* rt)
     // Clear sharedTexture on reload.
     cs_enter();
     if (sharedTexture) {
-        if (g_cached_api == reshade::api::device_api::opengl) { // use cached — avoids 2 virtual calls
+        if (g_cached_api == reshade::api::device_api::opengl) {
+            // OpenGL interop objects MUST be freed on every reload — they are
+            // tied to the specific GL texture handle which changes after recompile.
             if (g_gl_mem_obj && s_glDeleteMemoryObjectsEXT) {
                 s_glDeleteMemoryObjectsEXT(1, &g_gl_mem_obj); g_gl_mem_obj = 0;
             }
@@ -1086,9 +1092,13 @@ static void on_reloaded_with_fa(reshade::api::effect_runtime* rt)
                 s_wglDXCloseDeviceNV(g_wgl_device); g_wgl_device = nullptr;
             }
             g_gl_ext_active = false;
+            release_shared(g_cached_api);
+            g_src_width = 0; g_src_height = 0; g_src_format = SRC_FORMAT_UNSET;
         }
-        release_shared(g_cached_api); // use cached — avoids 2 virtual calls
-        g_src_width = 0; g_src_height = 0; g_src_format = SRC_FORMAT_UNSET;
+        // For D3D/Vulkan: do NOT release sharedTexture here.
+        // export_effects will reuse it if source dims still match, keeping
+        // KatangaMappedFile handle stable so VRScreenCap stays connected.
+        // If dims changed, export_effects calls release_shared internally.
     }
     cs_leave();
 
@@ -1100,14 +1110,19 @@ static void on_reloaded_with_fa(reshade::api::effect_runtime* rt)
         if (vt_check.handle == 0) {
             if (g_reload_count < 2) {
                 LOG_ERR("SuperVrExport: DoubleTex not found — forcing reload");
+                // Set SD3D preprocessors now — texTOT not present means SD3D pipeline needed.
+                // Doing this here (not on_init) avoids breaking Geo3D games that already have texTOT.
+                rt->set_preprocessor_definition("EX_DLP_FS_Mode",   "1");
+                rt->set_preprocessor_definition("DoubleBuffer_Mode", "1");
                 g_reload_attempted = true; ++g_reload_count; rt->reload_effect_next_frame(nullptr); return;
             }
             LOG_ERR("SuperVrExport: DoubleTex still missing — giving up");
         } else {
-            LOG_INF("SuperVrExport: DoubleTex found, proceeding");
         }
     }
 
+    // Only set mode on first stable setup — re-applying on every reload
+    // causes a momentary Stereoscopic_Mode reset that glitches frame sequential output.
     apply_fa_state(rt, true);
     export_effects(rt);
     // g_cached_vr_tex already populated by export_effects if found — no re-search needed.
@@ -1151,8 +1166,9 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
             && sharedTexture != reinterpret_cast<void*>(static_cast<uintptr_t>(1u))) {
             static_cast<IUnknown*>(sharedTexture)->Release();
         }
-        if (g_katanga_view)    UnmapViewOfFile(g_katanga_view);
-        if (g_katanga_mapping) CloseHandle(g_katanga_mapping);
+        // Do NOT close KatangaMappedFile on DLL unload.
+        // Keeping it alive means reload finds the existing mapping,
+        // so KatanaVR stays connected. OS cleans up at process exit.
         if (g_d3d11_context) { g_d3d11_context->Release(); g_d3d11_context = nullptr; }
         if (g_d3d11_device)  { g_d3d11_device->Release();  g_d3d11_device  = nullptr; }
         reshade::unregister_addon(hModule);

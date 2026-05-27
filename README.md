@@ -6,7 +6,7 @@
 [![Platform](https://img.shields.io/badge/Windows-DX9%20%7C%20DX10%20%7C%20DX11%20%7C%20DX12%20%7C%20Vulkan%20%7C%20OpenGL-0078D4.svg)](#)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-**A ReShade addon that exports SuperDepth3D's stereoscopic output directly to KatanaVR / VRScreenCap at full resolution with zero intermediate capture.**
+**Two ReShade addons that export stereoscopic 3D output directly to KatanaVR / VRScreenCap at full resolution with zero intermediate capture.**
 
 </div>
 
@@ -21,18 +21,25 @@
 
 ---
 
-## 💡 What It Does
+## 🗂️ Which Addon Do I Need?
 
-SuperVrExport hooks into ReShade's effect pipeline and shares the stereo 3D frame with KatanaVR or VRScreenCap every frame via a cross-process DXGI shared texture — no screen capture, no resolution loss, no latency beyond one frame.
+| Addon | Use for |
+|---|---|
+| **`SuperVrExport.addon64`** | Games using **SuperDepth3D** to generate stereo (SD3D + 3DToElse) |
+| **`GeoVrExport.addon64`** | Games with **native frame-sequential / Geo3D stereo output** (3DToElse only, no SuperDepth3D) |
 
-The addon **automatically configures SuperDepth3D** on startup: it sets the required preprocessors and output mode. You do not need to change any shader settings manually.
+**Not sure?** If you are adding stereoscopic 3D to a game yourself using the SuperDepth3D shader, use **SuperVrExport**. If the game already outputs stereo natively (e.g. Geo-3D titles, Yakuza series, OPUS Prism Peak), use **GeoVrExport**.
 
 ---
 
-## 🎮 How It Works — SuperDepth3D Pipeline
+## 💡 How It Works
+
+Both addons hook into ReShade's effect pipeline and share the stereo 3D frame with KatanaVR or VRScreenCap every frame via a cross-process DXGI shared texture — no screen capture, no resolution loss, no latency beyond one frame.
+
+### SuperVrExport pipeline (SuperDepth3D games)
 
 ```
-SuperDepth3D (Frame Sequential mode, set automatically)
+SuperDepth3D (Frame Sequential mode, configured automatically)
         │  alternating L/R full-frame output each frame
         ▼
 3DToElse.fx (Frame Sequential input, set by user once)
@@ -42,12 +49,11 @@ SuperVrExport addon
         │  copies texTOT to a shared GPU texture each frame
         ▼
 KatangaMappedFile  ←  KatanaVR / VRScreenCap reads this handle
-        │
         ▼
  KatanaVR  →  VR headset (full resolution SBS)
 ```
 
-### What the addon sets automatically
+**What SuperVrExport sets automatically:**
 
 | Preprocessor / Uniform | Value | Why |
 |---|---|---|
@@ -56,6 +62,25 @@ KatangaMappedFile  ←  KatanaVR / VRScreenCap reads this handle
 | `Stereoscopic_Mode` | `6` (Frame Sequential) | Set automatically after compile |
 | `FS_FA` | `true` | Enables addon-driven frame alternation |
 
+### GeoVrExport pipeline (Geo3D / native frame-sequential games)
+
+```
+Game (native frame-sequential stereo output)
+        │  alternating L/R full-frame output each frame
+        ▼
+3DToElse.fx (Frame Sequential input, set by user once)
+        │  reconstructs current + previous frame into full SBS (texTOT)
+        ▼
+GeoVrExport addon
+        │  copies texTOT to a shared GPU texture each frame
+        ▼
+KatangaMappedFile  ←  KatanaVR / VRScreenCap reads this handle
+        ▼
+ KatanaVR  →  VR headset (full resolution SBS)
+```
+
+GeoVrExport sets **nothing automatically** — it simply reads the existing texTOT output from 3DToElse and shares it. No SuperDepth3D required.
+
 ---
 
 ## 📦 Requirements
@@ -63,14 +88,14 @@ KatangaMappedFile  ←  KatanaVR / VRScreenCap reads this handle
 | Component | Version / Notes |
 |---|---|
 | **ReShade** | 6.3.x or newer, installed in **DXGI proxy mode** (`dxgi.dll`) for D3D12 games |
-| **SuperDepth3D.fx** | v5.3.8 or newer — must include `EX_DLP_FS_Mode` and `DoubleBuffer_Mode` preprocessors |
-| **3DToElse.fx** | Required. Included in the `Effects/` folder |
+| **SuperDepth3D.fx** | v5.3.8 or newer — **SuperVrExport only.** Must include `EX_DLP_FS_Mode` and `DoubleBuffer_Mode` preprocessors |
+| **3DToElse.fx** | Required for both addons. Included in the `Effects/` folder |
 | **KatanaVR / VRScreenCap** | 0.4.0-dev5 or newer. Must be started **after** the game |
 | **OS** | Windows 10 2004+ or Windows 11 |
 
 ---
 
-## 🚀 Setup
+## 🚀 Setup — SuperVrExport (SuperDepth3D games)
 
 ### 1 — Install ReShade
 
@@ -99,13 +124,46 @@ Open the ReShade overlay, select the **To_Else** technique, and set:
 
 ### 5 — Launch the game
 
-Start the game. Within 2–3 seconds the addon will set the required preprocessors (triggering a one-time shader recompile), configure Frame Sequential mode, and write the shared handle to `KatangaMappedFile`.
+Start the game. Within 2–3 seconds the addon will configure Frame Sequential mode and write the shared handle to `KatangaMappedFile`.
 
 ### 6 — Start KatanaVR / VRScreenCap
 
 Launch the viewer **after** the game has loaded. It reads `KatangaMappedFile` and opens the shared texture automatically.
 
 > If the viewer was already running before the game, restart it after the game loads.
+
+---
+
+## 🚀 Setup — GeoVrExport (Geo3D / native frame-sequential games)
+
+### 1 — Install ReShade
+
+Download [ReShade](https://reshade.me) and install it for your game selecting the **DXGI** API.
+
+### 2 — Copy shader file
+
+Copy **`3DToElse.fx`** into your `reshade-shaders\Shaders\` folder and enable the **To_Else** technique in the ReShade overlay. SuperDepth3D is **not needed**.
+
+### 3 — Install the addon
+
+Copy **`GeoVrExport.addon64`** to the same folder as `dxgi.dll`.
+
+### 4 — Configure 3DToElse
+
+Open the ReShade overlay, select the **To_Else** technique, and set:
+
+| Setting | Value |
+|---|---|
+| **Stereoscopic Mode Input** | **Frame Sequential** (index 5) |
+| **3D Display Mode** | **Side by Side** (index 0) |
+
+### 5 — Launch the game
+
+Start the game. The addon reads texTOT from 3DToElse immediately — no recompile required.
+
+### 6 — Start KatanaVR / VRScreenCap
+
+Launch the viewer **after** the game has loaded.
 
 ---
 
@@ -118,22 +176,11 @@ Direct3D 9 games require an extra step because D3D9's shared texture support is 
 1. Download [dgVoodoo2](https://dege.freeweb.hu/dgVoodoo2/dgVoodoo2/) and extract it
 2. Copy `D3D9.dll` (from dgVoodoo2's `MS\x64\` folder) into your game folder
 3. Install ReShade for the game selecting the **D3D11** API — ReShade will now intercept the translated D3D11 output
-4. Follow the standard setup steps above
+4. Follow the relevant setup steps above
 
 > Without dgVoodoo2 the addon will attempt a native D3D9 bridge path but this may fail or produce black frames depending on the game and driver. The D3D11 translation via dgVoodoo2 is the recommended and most reliable approach.
 
 > 📺 **Follow this tutorial for the dgVoodoo2 setup:** [dgVoodoo2 Setup Guide](https://www.youtube.com/watch?v=66shwiE3Jc8)
-
----
-
-## 🌐 Geo3D / Frame Sequential Games
-
-For games that natively output frame sequential stereo (e.g. Geo-3D titles):
-
-1. Enable **3DToElse.fx** in ReShade
-2. Set **Stereoscopic Mode Input = Frame Sequential**
-3. The addon reads `texTOT` from 3DToElse — no SuperDepth3D required
-4. Start KatanaVR after the game
 
 ---
 
@@ -145,18 +192,19 @@ For games that natively output frame sequential stereo (e.g. Geo-3D titles):
 | Black screen in headset | Confirm `first copy fired` in `ReShade.log`. Restart KatanaVR |
 | D3D9 game: black / no connection | Use dgVoodoo2 to translate D3D9 → D3D11. See section above |
 | Addon not in ReShade list | Ensure `.addon64` is next to `dxgi.dll`; reinstall ReShade with "Install add-ons" checked |
-| `DoubleTex not found` loop | Normal on first launch — resolves within 3 seconds |
-| Virtual controller freeze | Wait 2 seconds — reload guard prevents infinite loop |
+| `DoubleTex not found` loop | Normal on first launch of SuperVrExport — resolves within 3 seconds |
+| Game crashes with SuperVrExport | Confirm the game uses SuperDepth3D. For native Geo3D games use GeoVrExport instead |
+| Game crashes with GeoVrExport | Confirm 3DToElse is enabled and Stereoscopic Mode Input is set to Frame Sequential |
 
 ### Reading ReShade.log
 
 | Message | Meaning |
 |---|---|
-| `D3D12 ready (D3D11 bridge, ...)` | Bridge established — start KatanaVR now |
-| `D3D11 ready` | Bridge established — start KatanaVR now |
+| `SuperVrExport: D3D12 ready` | Bridge established — start KatanaVR now |
+| `SuperVrExport: D3D11 ready` | Bridge established — start KatanaVR now |
+| `GeoVrExport: D3D11 ready` | Bridge established — start KatanaVR now |
 | `first copy fired, src=... dst=...` | GPU copy is working |
-| `VR buffer not found` | texTOT temporarily unavailable during reload — resolves automatically |
-| `DoubleTex not found — forcing reload` | Normal on startup, triggers one shader recompile |
+| `DoubleTex not found — forcing reload` | SuperVrExport startup — normal, triggers one shader recompile |
 
 ---
 
@@ -168,14 +216,16 @@ Requires Visual Studio 2019 or 2022 with the C++ Desktop workload.
 build.bat
 ```
 
-Downloads ReShade headers automatically and produces:
+If `include_v6.3.3\` and `include_latest\` are already present, builds immediately. Otherwise downloads ReShade headers automatically. Produces:
 
 ```
-bin\x86_api14\SuperVrExport.addon    ← x86, ReShade 6.3.x
-bin\x64_api14\SuperVrExport.addon64  ← x64, ReShade 6.3.x
-bin\x86_api16\SuperVrExport.addon    ← x86, ReShade 6.4+
-bin\x64_api16\SuperVrExport.addon64  ← x64, ReShade 6.4+
+bin\reshade_6.3.x\SuperVrExport.addon32   bin\reshade_6.3.x\SuperVrExport.addon64
+bin\reshade_6.3.x\GeoVrExport.addon32     bin\reshade_6.3.x\GeoVrExport.addon64
+bin\reshade_latest\SuperVrExport.addon32  bin\reshade_latest\SuperVrExport.addon64
+bin\reshade_latest\GeoVrExport.addon32    bin\reshade_latest\GeoVrExport.addon64
 ```
+
+Use `.addon64` for 64-bit games (most modern games) and `.addon32` for 32-bit games. Check your ReShade version in the overlay top-left corner to pick the right folder.
 
 ---
 
