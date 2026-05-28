@@ -95,6 +95,8 @@ sampler BackBuffer
 		MagFilter = POINT;
 		MinFilter = POINT;
 		MipFilter = POINT;
+		AddressU = MIRROR;
+		AddressV = MIRROR;
 	};
 
 texture texTOT  { Width = BUFFER_WIDTH*2; Height = BUFFER_HEIGHT; Format = RGB10A2;};
@@ -134,6 +136,8 @@ sampler PSBackBuffer
 		MagFilter = POINT;
 		MinFilter = POINT;
 		MipFilter = POINT;
+		AddressU = MIRROR;
+		AddressV = MIRROR;
 	};
  
 ////////////////////////////////////////////////Left/Right Eye////////////////////////////////////////////////////////

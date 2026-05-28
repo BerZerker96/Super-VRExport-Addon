@@ -181,7 +181,7 @@ static void*            sharedTexture       = nullptr;  // API-specific copy dst
 static void*            sharedTexture_D3D11 = nullptr;  // always D3D11 tex for KatanaVR
 // FIX: single persistent file mapping handle (no leak on repeated calls)
 static HANDLE           g_katanga_mapping   = nullptr;
-static HANDLE*          g_katanga_view      = nullptr;
+static DWORD*           g_katanga_view      = nullptr;
 
 // OpenGL interop handles
 static HANDLE  g_wgl_device  = nullptr;
@@ -374,20 +374,21 @@ static bool ensure_d3d11_device(IDXGIAdapter* adapter = nullptr)
     return g_d3d11_device != nullptr;
 }
 
-// FIX: persistent file mapping — create once, update in-place
+// Write KMT handle to KatangaMappedFile.
+// Katanga reads it as UINT/DWORD (4 bytes) via *(PUINT)(pMappedView).
+// KMT handles always fit in 32 bits on x64 (Windows LLP64 model, per Katanga source).
+// Mapping size is sizeof(DWORD) to match exactly what Katanga reads.
+// Recreated on every call so Katanga detects the new handle via OpenFileMapping.
 static void write_katanga_handle(HANDLE h)
 {
-    // Recreate mapping every call so KatanaVR detects the new handle.
-    // KatanaVR opens KatangaMappedFile by name — closing and recreating
-    // signals it to re-open and pick up the new D3D resource handle.
     if (g_katanga_view)    { UnmapViewOfFile(g_katanga_view);  g_katanga_view    = nullptr; }
     if (g_katanga_mapping) { CloseHandle(g_katanga_mapping);   g_katanga_mapping = nullptr; }
     g_katanga_mapping = CreateFileMapping(INVALID_HANDLE_VALUE, nullptr,
-        PAGE_READWRITE, 0, sizeof(h), L"Local\\KatangaMappedFile");
+        PAGE_READWRITE, 0, sizeof(DWORD), L"Local\\KatangaMappedFile");
     if (!g_katanga_mapping) return;
-    g_katanga_view = reinterpret_cast<HANDLE*>(MapViewOfFile(
-        g_katanga_mapping, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(h)));
-    if (g_katanga_view) *g_katanga_view = h;
+    g_katanga_view = reinterpret_cast<DWORD*>(MapViewOfFile(
+        g_katanga_mapping, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(DWORD)));
+    if (g_katanga_view) *g_katanga_view = (DWORD)(uintptr_t)h;
 }
 
 // Forward declaration — defined and initialised here (used in release_shared above share_d3d9).
@@ -514,7 +515,7 @@ static void share_d3d11(ID3D11Texture2D* src, ID3D11Device* dev,
     d.BindFlags    = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
     d.CPUAccessFlags = 0;
     d.Usage        = D3D11_USAGE_DEFAULT; // source may be DYNAMIC; shared tex must be DEFAULT
-    d.MiscFlags    = D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
+    d.MiscFlags    = D3D11_RESOURCE_MISC_SHARED; // KEYEDMUTEX breaks GetSharedHandle — use plain SHARED
     d.Format = dxgi_ensure_typed(d.Format);
 
     // Unity: KEYEDMUTEX on game device crashes. Use standalone bridge.
@@ -534,14 +535,16 @@ static void share_d3d11(ID3D11Texture2D* src, ID3D11Device* dev,
     if (FAILED(dev->CreateTexture2D(&d, nullptr, &shared))) {
         LOG_ERR("SuperVrExport: D3D11 CreateTexture2D failed"); return;
     }
-    IDXGIKeyedMutex* mutex = nullptr;
-    shared->QueryInterface(__uuidof(IDXGIKeyedMutex), reinterpret_cast<void**>(&mutex));
+    // Use plain SHARED — SHARED_KEYEDMUTEX causes GetSharedHandle to return null,
+    // writing zero to KatangaMappedFile and causing black screen in Katanga.
+    // Documented in Katanga ProjectNotes: Unity stops drawing entirely with KEYEDMUTEX.
+    // The keyed mutex is not needed here since flush_immediate_command_list provides sync.
     IDXGIResource* r = nullptr; HANDLE leg = nullptr;
     if (SUCCEEDED(shared->QueryInterface(IID_PPV_ARGS(&r)))) { r->GetSharedHandle(&leg); r->Release(); }
-    if (!leg) { shared->Release(); if (mutex) mutex->Release(); LOG_ERR("SuperVrExport: D3D11 GetSharedHandle failed"); return; }
+    if (!leg) { shared->Release(); LOG_ERR("SuperVrExport: D3D11 GetSharedHandle failed"); return; }
 
     write_katanga_handle(leg);
-    sharedTextureMutex  = mutex;
+    sharedTextureMutex  = nullptr;
     sharedTexture_D3D11 = shared;
     sharedTexture       = shared;
     LOG_INF("SuperVrExport: D3D11 ready");
@@ -554,20 +557,18 @@ static void share_d3d10(ID3D10Texture2D* src, ID3D10Device* dev)
     d.BindFlags    = D3D10_BIND_RENDER_TARGET | D3D10_BIND_SHADER_RESOURCE;
     d.CPUAccessFlags = 0;
     d.Usage        = D3D10_USAGE_DEFAULT;
-    d.MiscFlags    = D3D10_RESOURCE_MISC_SHARED_KEYEDMUTEX;
+    d.MiscFlags    = D3D10_RESOURCE_MISC_SHARED; // KEYEDMUTEX breaks GetSharedHandle — use plain SHARED
 
     ID3D10Texture2D* shared = nullptr;
     if (FAILED(dev->CreateTexture2D(&d, nullptr, &shared))) {
         LOG_ERR("SuperVrExport: D3D10 CreateTexture2D failed"); return;
     }
-    IDXGIKeyedMutex* mutex = nullptr;
-    shared->QueryInterface(__uuidof(IDXGIKeyedMutex), reinterpret_cast<void**>(&mutex));
     IDXGIResource* r = nullptr; HANDLE leg = nullptr;
     if (SUCCEEDED(shared->QueryInterface(IID_PPV_ARGS(&r)))) { r->GetSharedHandle(&leg); r->Release(); }
-    if (!leg) { shared->Release(); if (mutex) mutex->Release(); LOG_ERR("SuperVrExport: D3D10 GetSharedHandle failed"); return; }
+    if (!leg) { shared->Release(); LOG_ERR("SuperVrExport: D3D10 GetSharedHandle failed"); return; }
 
     write_katanga_handle(leg);
-    sharedTextureMutex  = mutex;
+    sharedTextureMutex  = nullptr;
     sharedTexture_D3D11 = nullptr; // D3D10 tex stored separately
     sharedTexture       = shared;
     LOG_INF("SuperVrExport: D3D10 ready");
@@ -631,8 +632,6 @@ static void share_d3d12(ID3D12Resource* src, ID3D12Device* dev)
     if (game_adapter) { game_adapter->Release(); game_adapter = nullptr; }
     if (!d11) { LOG_ERR("SuperVrExport: D3D12 bridge: create_d3d11_shared failed"); return; }
     if (!nt_for_d3d12) { LOG_ERR("SuperVrExport: D3D12 bridge: KMT handle from D3D11 failed"); return; }
-    LOG_INF("SuperVrExport: D3D12 bridge: got KMT handle, opening on game D3D12 device");
-
     // Open the D3D11 shared texture on the game D3D12 device using the KMT handle.
     // D3D12::OpenSharedHandle accepts KMT handles from D3D11 SHARED textures.
     // DO NOT CloseHandle on KMT handles — they are not reference-counted like NT handles.
@@ -968,7 +967,12 @@ void export_effects(reshade::api::effect_runtime* rt)
     auto src_desc = rt->get_device()->get_resource_desc(res);
     uint32_t src_w = src_desc.texture.width, src_h = src_desc.texture.height;
     auto     src_f = src_desc.texture.format;
+    // Fast non-CS dims check: if already sharing at same resolution, skip setup.
+    // This avoids taking the CS on every reload (which causes deadlock when
+    // D3D11CreateDevice fires ReShade hooks that try to re-enter export_effects).
+    if (sharedTexture && src_w == g_src_width && src_h == g_src_height && src_f == g_src_format) return;
     cs_enter();
+    // Re-check under CS in case another thread just set up the bridge.
     if (sharedTexture && src_w == g_src_width && src_h == g_src_height && src_f == g_src_format) { cs_leave(); return; }
     // Source changed or first call — release and re-setup.
     if (sharedTexture) release_shared(rt->get_device()->get_api());
@@ -1058,9 +1062,13 @@ void add_copy_command(reshade::api::effect_runtime* rt,
 static void on_init_runtime(reshade::api::effect_runtime* rt)
 {
     g_active_runtime   = rt;
-    // Reset reload state on fresh init, but not after controller inserts
-    // (g_vr_ready means we already found everything — don't reload again).
-    if (!g_vr_ready) { g_reload_attempted = false; g_reload_count = 0; }
+    // Only reset reload state on a true fresh start (count==0 means never tried).
+    // Do NOT reset g_reload_count here — the reload itself triggers destroy/recreate
+    // cycles, so on_init_runtime fires multiple times during a single reload sequence.
+    // Resetting the count each time bypassed the g_reload_count < 2 guard entirely,
+    // causing an infinite cascade that destabilised frame sequential mode.
+    // g_reload_attempted is reset only when count is 0 (genuine first init).
+    if (!g_vr_ready && g_reload_count == 0) { g_reload_attempted = false; }
     g_tex_cache_dirty  = true;  // invalidate cache on new runtime (race-safe)
     g_cached_api       = rt->get_device()->get_api(); // cache API — never changes per runtime
     // Preprocessors are set in on_reloaded_with_fa only when texTOT is not found
@@ -1117,17 +1125,21 @@ static void on_reloaded_with_fa(reshade::api::effect_runtime* rt)
                 g_reload_attempted = true; ++g_reload_count; rt->reload_effect_next_frame(nullptr); return;
             }
             LOG_ERR("SuperVrExport: DoubleTex still missing — giving up");
-        } else {
         }
     }
 
-    // Only set mode on first stable setup — re-applying on every reload
-    // causes a momentary Stereoscopic_Mode reset that glitches frame sequential output.
-    apply_fa_state(rt, true);
+    // export_effects populates g_cached_vr_tex — must run first.
     export_effects(rt);
-    // g_cached_vr_tex already populated by export_effects if found — no re-search needed.
+    // Only apply FA state once DoubleTex is confirmed present.
+    // During the reload cascade (DoubleTex not yet found) the runtime is
+    // destroyed/recreated immediately after, resetting any uniforms we set here.
+    // Applying mid-cascade causes the FS mode to flicker on/off, which is the
+    // frame sequential instability seen in practice.
     if (g_cached_vr_tex.handle != 0) {
-        g_vr_ready = true;
+        apply_fa_state(rt, true);
+        g_vr_ready        = true;
+        g_reload_count    = 0;     // reset so a future session can retry from scratch
+        g_reload_attempted = false; // reset so a shader reload that loses DoubleTex can retry
     }
 }
 
@@ -1190,13 +1202,41 @@ static void on_begin_effects_wgl(reshade::api::effect_runtime* rt,
 
 static void on_destroy_runtime(reshade::api::effect_runtime* rt)
 {
-    apply_fa_state(rt, false);
+    // Only revert FA state if fully running — not during the initial reload cascade
+    // where g_vr_ready is still false. Calling apply_fa_state(false) mid-cascade
+    // resets Stereoscopic_Mode/FS_FA on the runtime on_reloaded_with_fa just
+    // configured, contributing to frame-sequential flicker.
+    if (g_vr_ready) apply_fa_state(rt, false);
     if (g_active_runtime == rt) {
         g_active_runtime = nullptr;
         cs_enter();
-        release_shared(g_cached_api); // use cached — avoids 2 virtual calls
+        auto api = g_cached_api;
+        // For D3D11: the device and KEYEDMUTEX texture survive ResizeBuffers intact.
+        // Don't release — let the dims check in export_effects decide whether to
+        // recreate. Same dims = instant reuse, no copy gap. Different dims = recreate.
+        // For D3D12/Vulkan/D3D9: always release (bridge resources tied to the runtime).
+        if (api != reshade::api::device_api::d3d11) {
+            // For D3D12: flush the command queue before releasing the shared resource.
+            // sharedTexture is an ID3D12Resource* opened on the game device via
+            // OpenSharedHandle. Releasing it while the GPU has in-flight work
+            // referencing it causes a driver stall/freeze (seen on Alan Wake 2,
+            // 2-buffer swapchain where the reload cascade destroys the runtime
+            // while copy_resource commands are still queued).
+            if (api == reshade::api::device_api::d3d12 && sharedTexture) {
+                rt->get_command_queue()->flush_immediate_command_list();
+            }
+            release_shared(api);
+            g_src_width = 0; g_src_height = 0; g_src_format = SRC_FORMAT_UNSET;
+            // Release our standalone D3D11 device on D3D12 runtime destroy.
+            // Keeping it alive triggers ReShade ref-count warnings when the game
+            // creates its own D3D11 device (e.g. RE9 main menu) — crash follows.
+            // ensure_d3d11_device() will create a fresh device on next setup.
+            if (api == reshade::api::device_api::d3d12) {
+                if (g_d3d11_context) { g_d3d11_context->Release(); g_d3d11_context = nullptr; }
+                if (g_d3d11_device)  { g_d3d11_device->Release();  g_d3d11_device  = nullptr; }
+            }
+        }
         if (g_d3d9_shared_tex) { g_d3d9_shared_tex->Release(); g_d3d9_shared_tex = nullptr; }
-        g_src_width = 0; g_src_height = 0; g_src_format = SRC_FORMAT_UNSET;
         g_vk_width  = 0; g_vk_height  = 0;
         cs_leave();
     }

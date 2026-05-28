@@ -12,8 +12,9 @@ extern "C" __declspec(dllexport) const char* NAME = "GeoVrExport";
 extern "C" __declspec(dllexport) const char* DESCRIPTION = "Export Geo3D / frame-sequential stereo buffers to KatanaVR and VRScreenCap.";
 
 
-static IDXGIKeyedMutex* sharedTextureMutex;
 static void* sharedTexture;
+static HANDLE g_katanga_mapping = nullptr;
+static DWORD* g_katanga_view    = nullptr;
 
 void share_d3d11_texture(ID3D11Texture2D* texture, ID3D11Device* device)
 {
@@ -21,12 +22,12 @@ void share_d3d11_texture(ID3D11Texture2D* texture, ID3D11Device* device)
 	texture->GetDesc(&texDesc);
 	texDesc.BindFlags |= D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
 	texDesc.CPUAccessFlags = 0;
-	texDesc.MiscFlags = D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
-
-	if (sharedTextureMutex != NULL) {
-		sharedTextureMutex->Release();
-		sharedTextureMutex = NULL;
-	}
+	// SHARED (not SHARED_KEYEDMUTEX): GetSharedHandle only works with plain SHARED.
+	// SHARED_KEYEDMUTEX returns a null handle from GetSharedHandle, causing Katanga to
+	// get zero from the mapped file and hang in OpenSharedResource. Documented in
+	// Katanga ProjectNotes: Unity also stops drawing entirely when SHARED_KEYEDMUTEX
+	// is used, regardless of mutex state. Bo3b explicitly removed it for this reason.
+	texDesc.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
 
 	if (sharedTexture != NULL) {
 		((ID3D11Texture2D*)sharedTexture)->Release();
@@ -43,14 +44,6 @@ void share_d3d11_texture(ID3D11Texture2D* texture, ID3D11Device* device)
 		return;
 	}
 
-	result = stereoSharedBuffer->QueryInterface(__uuidof(IDXGIKeyedMutex), (void**)&sharedTextureMutex);
-	if (FAILED(result)) {
-		std::stringstream error;
-		error << "GeoVrExport: Could not get IDXGIKeyedMutex " << uint64_t(result);
-		reshade::log::message(reshade::log::level::error, error.str().c_str());
-		return;
-	}
-
 	HANDLE sharedHandle = nullptr;
 	IDXGIResource* tempResource = NULL;
 	result = stereoSharedBuffer->QueryInterface(__uuidof(IDXGIResource), (void**)&tempResource);
@@ -59,46 +52,35 @@ void share_d3d11_texture(ID3D11Texture2D* texture, ID3D11Device* device)
 		std::stringstream error;
 		error << "GeoVrExport: Could not get IDXGIResource " << uint64_t(result);
 		reshade::log::message(reshade::log::level::error, error.str().c_str());
+		stereoSharedBuffer->Release();
 		return;
 	}
 
 	result = tempResource->GetSharedHandle(&sharedHandle);
-
-	if (FAILED(result)) {
-		std::stringstream error;
-		error << "GeoVrExport: Could not create shared handle " << uint64_t(result);
-		reshade::log::message(reshade::log::level::error, error.str().c_str());
-		return;
-	}
-	else {
-		reshade::log::message(reshade::log::level::info, "GeoVrExport: D3D11 ready");
-	}
-
-	HANDLE katangaFile = CreateFileMapping(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, sizeof(sharedHandle), L"Local\\KatangaMappedFile");
-	if (katangaFile == NULL)
-	{
-		std::stringstream error;
-		error << "GeoVrExport: Could not create file mapping object " << GetLastError();
-		reshade::log::message(reshade::log::level::error, error.str().c_str());
-		return;
-	}
-
-	HANDLE* sharedResourceHandle = (HANDLE*)MapViewOfFile(katangaFile,
-		FILE_MAP_ALL_ACCESS,
-		0,
-		0,
-		sizeof(sharedHandle));
-
-	if (sharedResourceHandle == NULL)
-	{
-		std::stringstream error;
-		error << "GeoVrExport: Could not create map view of file " << GetLastError();
-		reshade::log::message(reshade::log::level::error, error.str().c_str());
-		return;
-	}
-
-	*sharedResourceHandle = sharedHandle;
 	tempResource->Release();
+
+	if (FAILED(result) || sharedHandle == nullptr) {
+		std::stringstream error;
+		error << "GeoVrExport: Could not get shared handle " << uint64_t(result);
+		reshade::log::message(reshade::log::level::error, error.str().c_str());
+		stereoSharedBuffer->Release();
+		return;
+	}
+
+	reshade::log::message(reshade::log::level::info, "GeoVrExport: D3D11 ready");
+
+	// Katanga reads the handle as UINT/DWORD (4 bytes) via *(PUINT)(pMappedView).
+	// KMT handles always fit in 32 bits on x64 (Windows LLP64 model).
+	// Persistent mapping: stays alive across DLL reload so Katanga stays connected.
+	// On reload: CreateFileMapping returns the existing named mapping, value updated in-place.
+	if (!g_katanga_mapping) {
+		g_katanga_mapping = CreateFileMapping(INVALID_HANDLE_VALUE, NULL,
+			PAGE_READWRITE, 0, sizeof(DWORD), L"Local\\KatangaMappedFile");
+		if (!g_katanga_mapping) { stereoSharedBuffer->Release(); return; }
+		g_katanga_view = (DWORD*)MapViewOfFile(g_katanga_mapping,
+			FILE_MAP_ALL_ACCESS, 0, 0, sizeof(DWORD));
+	}
+	if (g_katanga_view) *g_katanga_view = (DWORD)(uintptr_t)sharedHandle;
 	sharedTexture = stereoSharedBuffer;
 }
 
@@ -147,15 +129,11 @@ void add_copy_command(reshade::api::effect_runtime* runtime, reshade::api::comma
 		if (src.handle != NULL && sharedTexture != NULL) {
 			reshade::api::resource dst;
 			dst.handle = uint64_t(sharedTexture);
-
-			if (sharedTextureMutex != NULL)
-				sharedTextureMutex->AcquireSync(0, 50);
-
+			// No keyed mutex — plain SHARED flag has no mutex support.
+			// flush_immediate_command_list ensures the copy is complete before
+			// Katanga's reader calls OpenSharedResource on the same texture.
 			runtime->get_command_queue()->get_immediate_command_list()->copy_resource(src, dst);
 			runtime->get_command_queue()->flush_immediate_command_list();
-
-			if (sharedTextureMutex != NULL)
-				sharedTextureMutex->ReleaseSync(0);
 		}
 	}
 }

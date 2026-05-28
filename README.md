@@ -18,6 +18,8 @@
 |---|---|
 | **[artumino](https://github.com/artumino/ReshadeVRExport)** | Original ReshadeVRExport — architecture, shared-texture pipeline, and Geo3D support that this project is built on |
 | **[BlueSkyDefender](https://github.com/BlueSkyDefender/Depth3D)** | Author of SuperDepth3D and the Frame Alternation / DoubleBuffer additions that make the direct export pipeline possible |
+| **[bo3b](https://github.com/bo3b/katanga)** | Author of Katanga VR — the VR display application this addon feeds. Reading the Katanga source code directly informed the correct IPC protocol (`KatangaMappedFile`, KMT handle size, `OpenSharedResource` requirements) and led to several critical bug fixes in this addon |
+| **[Flugan](https://github.com/Flugan/Geo3D-Installer)** | Author of Geo3D — the D3D11 stereoscopic mod that GeoVrExport is designed to work with |
 
 ---
 
@@ -26,9 +28,9 @@
 | Addon | Use for |
 |---|---|
 | **`SuperVrExport.addon64`** | Games using **SuperDepth3D** to generate stereo (SD3D + 3DToElse) |
-| **`GeoVrExport.addon64`** | Games with **native frame-sequential / Geo3D stereo output** (3DToElse only, no SuperDepth3D) |
+| **`GeoVrExport.addon64`** | Games using the **[Geo3D mod](https://github.com/Flugan/Geo3D-Installer)** for stereoscopic output (3DToElse only, no SuperDepth3D) |
 
-**Not sure?** If you are adding stereoscopic 3D to a game yourself using the SuperDepth3D shader, use **SuperVrExport**. If the game already outputs stereo natively (e.g. Geo-3D titles, Yakuza series, OPUS Prism Peak), use **GeoVrExport**.
+**Not sure?** If you are adding stereoscopic 3D to a game yourself using the SuperDepth3D shader, use **SuperVrExport**. If you are using the **[Geo3D mod](https://github.com/Flugan/Geo3D-Installer)** to inject stereo into a D3D11 game, use **GeoVrExport**.
 
 ---
 
@@ -62,10 +64,10 @@ KatangaMappedFile  ←  KatanaVR / VRScreenCap reads this handle
 | `Stereoscopic_Mode` | `6` (Frame Sequential) | Set automatically after compile |
 | `FS_FA` | `true` | Enables addon-driven frame alternation |
 
-### GeoVrExport pipeline (Geo3D / native frame-sequential games)
+### GeoVrExport pipeline (Geo3D mod games)
 
 ```
-Game (native frame-sequential stereo output)
+Geo3D mod (injects frame-sequential stereo into D3D11 games)
         │  alternating L/R full-frame output each frame
         ▼
 3DToElse.fx (Frame Sequential input, set by user once)
@@ -79,7 +81,7 @@ KatangaMappedFile  ←  KatanaVR / VRScreenCap reads this handle
  KatanaVR  →  VR headset (full resolution SBS)
 ```
 
-GeoVrExport sets **nothing automatically** — it simply reads the existing texTOT output from 3DToElse and shares it. No SuperDepth3D required.
+GeoVrExport sets **nothing automatically** — it simply reads the existing texTOT output from 3DToElse and shares it. No SuperDepth3D required. The Geo3D mod handles stereo generation independently.
 
 ---
 
@@ -134,21 +136,25 @@ Launch the viewer **after** the game has loaded. It reads `KatangaMappedFile` an
 
 ---
 
-## 🚀 Setup — GeoVrExport (Geo3D / native frame-sequential games)
+## 🚀 Setup — GeoVrExport (Geo3D mod games)
 
 ### 1 — Install ReShade
 
 Download [ReShade](https://reshade.me) and install it for your game selecting the **DXGI** API.
 
-### 2 — Copy shader file
+### 2 — Install the Geo3D mod
+
+Download and run the [Geo3D installer](https://github.com/Flugan/Geo3D-Installer) for your game. This injects the stereo frame-sequential output that GeoVrExport reads.
+
+### 3 — Copy shader file
 
 Copy **`3DToElse.fx`** into your `reshade-shaders\Shaders\` folder and enable the **To_Else** technique in the ReShade overlay. SuperDepth3D is **not needed**.
 
-### 3 — Install the addon
+### 4 — Install the addon
 
 Copy **`GeoVrExport.addon64`** to the same folder as `dxgi.dll`.
 
-### 4 — Configure 3DToElse
+### 5 — Configure 3DToElse
 
 Open the ReShade overlay, select the **To_Else** technique, and set:
 
@@ -157,11 +163,11 @@ Open the ReShade overlay, select the **To_Else** technique, and set:
 | **Stereoscopic Mode Input** | **Frame Sequential** (index 5) |
 | **3D Display Mode** | **Side by Side** (index 0) |
 
-### 5 — Launch the game
+### 6 — Launch the game
 
 Start the game. The addon reads texTOT from 3DToElse immediately — no recompile required.
 
-### 6 — Start KatanaVR / VRScreenCap
+### 7 — Start KatanaVR / VRScreenCap
 
 Launch the viewer **after** the game has loaded.
 
@@ -194,7 +200,7 @@ Direct3D 9 games require an extra step because D3D9's shared texture support is 
 | Addon not in ReShade list | Ensure `.addon64` is next to `dxgi.dll`; reinstall ReShade with "Install add-ons" checked |
 | `DoubleTex not found` loop | Normal on first launch of SuperVrExport — resolves within 3 seconds |
 | Game crashes with SuperVrExport | Confirm the game uses SuperDepth3D. For native Geo3D games use GeoVrExport instead |
-| Game crashes with GeoVrExport | Confirm 3DToElse is enabled and Stereoscopic Mode Input is set to Frame Sequential |
+| Game crashes with GeoVrExport | Confirm the [Geo3D mod](https://github.com/Flugan/Geo3D-Installer) is installed, 3DToElse is enabled, and Stereoscopic Mode Input is set to Frame Sequential |
 
 ### Reading ReShade.log
 
@@ -231,6 +237,6 @@ Use `.addon64` for 64-bit games (most modern games) and `.addon32` for 32-bit ga
 
 <div align="center">
 
-Original addon by **[artumino](https://github.com/artumino/ReshadeVRExport)** · SuperDepth3D by **[BlueSkyDefender](https://github.com/BlueSkyDefender/Depth3D)**
+Original addon by **[artumino](https://github.com/artumino/ReshadeVRExport)** · SuperDepth3D by **[BlueSkyDefender](https://github.com/BlueSkyDefender/Depth3D)** · Katanga VR by **[bo3b](https://github.com/bo3b/katanga)** · Geo3D by **[Flugan](https://github.com/Flugan/Geo3D-Installer)**
 
 </div>
