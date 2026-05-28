@@ -374,13 +374,12 @@ static bool ensure_d3d11_device(IDXGIAdapter* adapter = nullptr)
     return g_d3d11_device != nullptr;
 }
 
-// Write KMT handle to KatangaMappedFile.
-// Katanga reads it as UINT/DWORD (4 bytes) via *(PUINT)(pMappedView).
-// KMT handles always fit in 32 bits on x64 (Windows LLP64 model, per Katanga source).
-// Mapping size is sizeof(DWORD) to match exactly what Katanga reads.
-// Recreated on every call so Katanga detects the new handle via OpenFileMapping.
+// FIX: persistent file mapping — create once, update in-place
 static void write_katanga_handle(HANDLE h)
 {
+    // Recreate mapping every call so KatanaVR detects the new handle.
+    // KatanaVR opens KatangaMappedFile by name — closing and recreating
+    // signals it to re-open and pick up the new D3D resource handle.
     if (g_katanga_view)    { UnmapViewOfFile(g_katanga_view);  g_katanga_view    = nullptr; }
     if (g_katanga_mapping) { CloseHandle(g_katanga_mapping);   g_katanga_mapping = nullptr; }
     g_katanga_mapping = CreateFileMapping(INVALID_HANDLE_VALUE, nullptr,
@@ -397,7 +396,12 @@ static IDirect3DTexture9* g_d3d9_shared_tex = nullptr;
 // FIX: unified cleanup — releases sharedTexture and sharedTexture_D3D11 safely
 static void release_shared(reshade::api::device_api api)
 {
-    if (sharedTextureMutex) { sharedTextureMutex->Release(); sharedTextureMutex = nullptr; }
+    // sharedTextureMutex == (IDXGIKeyedMutex*)1 is a sentinel meaning "no mutex, skip flush"
+    // for D3D11 plain SHARED path. Don't call Release() on it.
+    if (sharedTextureMutex && sharedTextureMutex != reinterpret_cast<IDXGIKeyedMutex*>(1)) {
+        sharedTextureMutex->Release();
+    }
+    sharedTextureMutex = nullptr;
     // Release the API-specific copy dst
     if (sharedTexture && sharedTexture != sharedTexture_D3D11) {
         switch (api) {
@@ -462,9 +466,11 @@ static ID3D11Texture2D* create_d3d11_shared(
     // No IDXGIKeyedMutex (incompatible with SHARED flag).
     // Callers call release_shared before create_d3d11_shared, so these are normally
     // already null. The checks here guard against direct calls (e.g. Vulkan/OpenGL paths).
-    if (sharedTextureMutex)  { sharedTextureMutex->Release();  sharedTextureMutex  = nullptr; }
-    if (sharedTexture_D3D11) { static_cast<ID3D11Texture2D*>(sharedTexture_D3D11)->Release(); sharedTexture_D3D11 = nullptr; }
+    if (sharedTextureMutex && sharedTextureMutex != reinterpret_cast<IDXGIKeyedMutex*>(1)) {
+        sharedTextureMutex->Release();
+    }
     sharedTextureMutex  = nullptr; // no keyed mutex with SHARED flag
+    if (sharedTexture_D3D11) { static_cast<ID3D11Texture2D*>(sharedTexture_D3D11)->Release(); sharedTexture_D3D11 = nullptr; }
     sharedTexture_D3D11 = tex;
     return tex;
 }
@@ -515,7 +521,7 @@ static void share_d3d11(ID3D11Texture2D* src, ID3D11Device* dev,
     d.BindFlags    = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
     d.CPUAccessFlags = 0;
     d.Usage        = D3D11_USAGE_DEFAULT; // source may be DYNAMIC; shared tex must be DEFAULT
-    d.MiscFlags    = D3D11_RESOURCE_MISC_SHARED; // KEYEDMUTEX breaks GetSharedHandle — use plain SHARED
+    d.MiscFlags    = D3D11_RESOURCE_MISC_SHARED; // KEYEDMUTEX breaks GetSharedHandle (returns null) — plain SHARED works
     d.Format = dxgi_ensure_typed(d.Format);
 
     // Unity: KEYEDMUTEX on game device crashes. Use standalone bridge.
@@ -528,6 +534,7 @@ static void share_d3d11(ID3D11Texture2D* src, ID3D11Device* dev,
             LOG_ERR("SuperVrExport: Unity bridge: OpenSharedResource failed"); return;
         }
         sharedTexture = game_side;
+        sharedTextureMutex = reinterpret_cast<IDXGIKeyedMutex*>(1); // sentinel: D3D11 copies are synchronous
         LOG_INF("SuperVrExport: D3D11 ready (Unity standalone bridge)");
         return;
     }
@@ -535,16 +542,16 @@ static void share_d3d11(ID3D11Texture2D* src, ID3D11Device* dev,
     if (FAILED(dev->CreateTexture2D(&d, nullptr, &shared))) {
         LOG_ERR("SuperVrExport: D3D11 CreateTexture2D failed"); return;
     }
-    // Use plain SHARED — SHARED_KEYEDMUTEX causes GetSharedHandle to return null,
-    // writing zero to KatangaMappedFile and causing black screen in Katanga.
-    // Documented in Katanga ProjectNotes: Unity stops drawing entirely with KEYEDMUTEX.
-    // The keyed mutex is not needed here since flush_immediate_command_list provides sync.
+    // Plain SHARED: no IDXGIKeyedMutex available (incompatible with SHARED flag).
+    // D3D11 immediate context copy_resource is synchronous — no mutex or flush needed.
+    // Set sharedTextureMutex to a sentinel value (1) so add_copy_command skips
+    // flush_immediate_command_list (which would stall the GPU every frame on D3D11).
     IDXGIResource* r = nullptr; HANDLE leg = nullptr;
     if (SUCCEEDED(shared->QueryInterface(IID_PPV_ARGS(&r)))) { r->GetSharedHandle(&leg); r->Release(); }
     if (!leg) { shared->Release(); LOG_ERR("SuperVrExport: D3D11 GetSharedHandle failed"); return; }
 
     write_katanga_handle(leg);
-    sharedTextureMutex  = nullptr;
+    sharedTextureMutex  = reinterpret_cast<IDXGIKeyedMutex*>(1); // sentinel: non-null = skip flush, no AcquireSync
     sharedTexture_D3D11 = shared;
     sharedTexture       = shared;
     LOG_INF("SuperVrExport: D3D11 ready");
@@ -557,7 +564,7 @@ static void share_d3d10(ID3D10Texture2D* src, ID3D10Device* dev)
     d.BindFlags    = D3D10_BIND_RENDER_TARGET | D3D10_BIND_SHADER_RESOURCE;
     d.CPUAccessFlags = 0;
     d.Usage        = D3D10_USAGE_DEFAULT;
-    d.MiscFlags    = D3D10_RESOURCE_MISC_SHARED; // KEYEDMUTEX breaks GetSharedHandle — use plain SHARED
+    d.MiscFlags    = D3D10_RESOURCE_MISC_SHARED; // KEYEDMUTEX breaks GetSharedHandle — plain SHARED works
 
     ID3D10Texture2D* shared = nullptr;
     if (FAILED(dev->CreateTexture2D(&d, nullptr, &shared))) {
@@ -568,8 +575,8 @@ static void share_d3d10(ID3D10Texture2D* src, ID3D10Device* dev)
     if (!leg) { shared->Release(); LOG_ERR("SuperVrExport: D3D10 GetSharedHandle failed"); return; }
 
     write_katanga_handle(leg);
-    sharedTextureMutex  = nullptr;
-    sharedTexture_D3D11 = nullptr; // D3D10 tex stored separately
+    sharedTextureMutex  = reinterpret_cast<IDXGIKeyedMutex*>(1); // sentinel: skip flush, D3D10 copies are synchronous
+    sharedTexture_D3D11 = nullptr;
     sharedTexture       = shared;
     LOG_INF("SuperVrExport: D3D10 ready");
 }
@@ -644,7 +651,9 @@ static void share_d3d12(ID3D12Resource* src, ID3D12Device* dev)
     // KatangaMappedFile already written by create_d3d11_shared above.
 
     // sharedTexture = D3D12 resource (game device side) used as copy_resource dst.
-    // sharedTexture_D3D11 and sharedTextureMutex set by create_d3d11_shared (KatanaVR-facing).
+    // sharedTexture_D3D11 set by create_d3d11_shared (KatanaVR-facing).
+    // sharedTextureMutex left as nullptr (set by create_d3d11_shared) — D3D12 uses
+    // plain SHARED so no KeyedMutex is available. add_copy_command will flush instead.
     sharedTexture = d12;
 
     // Formats always match (D3D11 tex created in src_fmt) — no mismatch possible.
@@ -1042,18 +1051,24 @@ void add_copy_command(reshade::api::effect_runtime* rt,
         ? static_cast<uint64_t>(g_vk_image)
         : uint64_t(sharedTexture);
 
-    // No CS here — matches original artumino addon. Both export_effects and
-    // add_copy_command fire on the render thread, so no cross-thread race on
-    // sharedTexture. The CS in export_effects protects setup; the per-frame
-    // copy path needs no lock.
-    if (sharedTextureMutex)
-        sharedTextureMutex->AcquireSync(0, 0); // 0ms: non-blocking
+    // sharedTextureMutex == (IDXGIKeyedMutex*)1 is a sentinel for D3D11/D3D10 plain SHARED:
+    // non-null so flush is skipped, but NOT a real COM object — must not call methods on it.
+    static const auto kSentinel = reinterpret_cast<IDXGIKeyedMutex*>(1);
+    const bool realMutex = (sharedTextureMutex && sharedTextureMutex != kSentinel);
+
+    if (realMutex) sharedTextureMutex->AcquireSync(0, 0); // 0ms: non-blocking
 
     rt->get_command_queue()->get_immediate_command_list()->copy_resource(src, dst);
-    if (!sharedTextureMutex)
-        rt->get_command_queue()->flush_immediate_command_list();
+    // Do NOT flush here for D3D12 (sharedTextureMutex == nullptr).
+    // A per-frame flush_immediate_command_list() is a full CPU-blocked GPU stall —
+    // 60 stalls/sec destroys performance, creates frame-time jitter that breaks
+    // frame-sequential L/R alternation timing, and causes partial writes into the
+    // shared texture visible as square noise blocks in KatanaVR.
+    // The D3D11 bridge texture is on our standalone device; the driver handles
+    // cross-device sync via the shared handle. No per-frame flush needed.
+    // The flush lives only in on_destroy_runtime before releasing the D3D12 resource.
 
-    if (sharedTextureMutex) sharedTextureMutex->ReleaseSync(0);
+    if (realMutex) sharedTextureMutex->ReleaseSync(0);
 
 
 }
@@ -1061,16 +1076,27 @@ void add_copy_command(reshade::api::effect_runtime* rt,
 // ── Event handlers ─────────────────────────────────────────────────────────────
 static void on_init_runtime(reshade::api::effect_runtime* rt)
 {
-    g_active_runtime   = rt;
+    // Only track the first runtime we see as the active one.
+    // RE9 and other RE Engine games create a secondary 1x1 composition swapchain
+    // after the main one. If we overwrite g_active_runtime with it, add_copy_command
+    // returns immediately on every frame and the VR export stops.
+    // on_destroy_runtime clears g_active_runtime, so the next init after a real
+    // destroy correctly re-sets it to the new main runtime.
+    if (!g_active_runtime) {
+        g_active_runtime = rt;
+        g_cached_api     = rt->get_device()->get_api();
+    }
     // Only reset reload state on a true fresh start (count==0 means never tried).
     // Do NOT reset g_reload_count here — the reload itself triggers destroy/recreate
     // cycles, so on_init_runtime fires multiple times during a single reload sequence.
     // Resetting the count each time bypassed the g_reload_count < 2 guard entirely,
     // causing an infinite cascade that destabilised frame sequential mode.
     // g_reload_attempted is reset only when count is 0 (genuine first init).
-    if (!g_vr_ready && g_reload_count == 0) { g_reload_attempted = false; }
-    g_tex_cache_dirty  = true;  // invalidate cache on new runtime (race-safe)
-    g_cached_api       = rt->get_device()->get_api(); // cache API — never changes per runtime
+    if (rt == g_active_runtime) {
+        if (!g_vr_ready && g_reload_count == 0) { g_reload_attempted = false; }
+        g_tex_cache_dirty = true;  // invalidate cache on new runtime (race-safe)
+        g_cached_api      = rt->get_device()->get_api(); // refresh on recreate
+    }
     // Preprocessors are set in on_reloaded_with_fa only when texTOT is not found
     // (i.e. SuperDepth3D pipeline needed). Setting them here causes an immediate
     // SuperDepth3D recompile that destabilises 3DToElse texTOT on Geo3D games.
@@ -1079,6 +1105,10 @@ static void on_init_runtime(reshade::api::effect_runtime* rt)
 
 static void on_reloaded_with_fa(reshade::api::effect_runtime* rt)
 {
+    // Skip secondary runtimes — FA handles and shared state belong to g_active_runtime.
+    // If a secondary swapchain reloads, searching it would zero out g_fs_fa_handle
+    // (not found there) and disable frame sequential on the main swapchain.
+    if (rt != g_active_runtime) return;
     g_fs_fa_handle      = find_sd3d_uniform(rt, "FS_FA");
     g_stereo_mode_handle = find_sd3d_uniform(rt, "Stereoscopic_Mode");
     g_tex_cache_dirty  = true;
@@ -1172,7 +1202,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
         if (g_gl_mem_obj && s_glDeleteMemoryObjectsEXT) s_glDeleteMemoryObjectsEXT(1, &g_gl_mem_obj);
         if (g_wgl_object && g_wgl_device && s_wglDXUnregisterObjectNV) s_wglDXUnregisterObjectNV(g_wgl_device, g_wgl_object);
         if (g_wgl_device && s_wglDXCloseDeviceNV) s_wglDXCloseDeviceNV(g_wgl_device);
-        if (sharedTextureMutex) sharedTextureMutex->Release();
+        if (sharedTextureMutex && sharedTextureMutex != reinterpret_cast<IDXGIKeyedMutex*>(1))
+            sharedTextureMutex->Release();
         if (sharedTexture_D3D11) static_cast<ID3D11Texture2D*>(sharedTexture_D3D11)->Release();
         if (sharedTexture && sharedTexture != sharedTexture_D3D11
             && sharedTexture != reinterpret_cast<void*>(static_cast<uintptr_t>(1u))) {
@@ -1206,31 +1237,21 @@ static void on_destroy_runtime(reshade::api::effect_runtime* rt)
     // where g_vr_ready is still false. Calling apply_fa_state(false) mid-cascade
     // resets Stereoscopic_Mode/FS_FA on the runtime on_reloaded_with_fa just
     // configured, contributing to frame-sequential flicker.
-    if (g_vr_ready) apply_fa_state(rt, false);
+    if (g_vr_ready && rt == g_active_runtime) apply_fa_state(rt, false);
     if (g_active_runtime == rt) {
+        // Reset g_vr_ready so the next on_reloaded_with_fa re-applies FA state.
+        // Without this, g_vr_ready persists true across D3D12 scene transitions:
+        // the bridge is torn down but the uniform state (Stereoscopic_Mode, FS_FA)
+        // is lost when the runtime is destroyed — it must be re-written on next reload.
+        g_vr_ready = false;
         g_active_runtime = nullptr;
         cs_enter();
         auto api = g_cached_api;
-        // For D3D11: the device and KEYEDMUTEX texture survive ResizeBuffers intact.
-        // Don't release — let the dims check in export_effects decide whether to
-        // recreate. Same dims = instant reuse, no copy gap. Different dims = recreate.
-        // For D3D12/Vulkan/D3D9: always release (bridge resources tied to the runtime).
         if (api != reshade::api::device_api::d3d11) {
-            // For D3D12: flush the command queue before releasing the shared resource.
-            // sharedTexture is an ID3D12Resource* opened on the game device via
-            // OpenSharedHandle. Releasing it while the GPU has in-flight work
-            // referencing it causes a driver stall/freeze (seen on Alan Wake 2,
-            // 2-buffer swapchain where the reload cascade destroys the runtime
-            // while copy_resource commands are still queued).
-            if (api == reshade::api::device_api::d3d12 && sharedTexture) {
+            if (api == reshade::api::device_api::d3d12 && sharedTexture)
                 rt->get_command_queue()->flush_immediate_command_list();
-            }
             release_shared(api);
             g_src_width = 0; g_src_height = 0; g_src_format = SRC_FORMAT_UNSET;
-            // Release our standalone D3D11 device on D3D12 runtime destroy.
-            // Keeping it alive triggers ReShade ref-count warnings when the game
-            // creates its own D3D11 device (e.g. RE9 main menu) — crash follows.
-            // ensure_d3d11_device() will create a fresh device on next setup.
             if (api == reshade::api::device_api::d3d12) {
                 if (g_d3d11_context) { g_d3d11_context->Release(); g_d3d11_context = nullptr; }
                 if (g_d3d11_device)  { g_d3d11_device->Release();  g_d3d11_device  = nullptr; }

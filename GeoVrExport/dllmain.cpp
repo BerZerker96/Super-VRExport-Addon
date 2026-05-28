@@ -13,7 +13,7 @@ extern "C" __declspec(dllexport) const char* DESCRIPTION = "Export Geo3D / frame
 
 
 static void* sharedTexture;
-static HANDLE g_katanga_mapping = nullptr;
+static HANDLE  g_katanga_mapping = nullptr;
 static DWORD* g_katanga_view    = nullptr;
 
 void share_d3d11_texture(ID3D11Texture2D* texture, ID3D11Device* device)
@@ -22,11 +22,8 @@ void share_d3d11_texture(ID3D11Texture2D* texture, ID3D11Device* device)
 	texture->GetDesc(&texDesc);
 	texDesc.BindFlags |= D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
 	texDesc.CPUAccessFlags = 0;
-	// SHARED (not SHARED_KEYEDMUTEX): GetSharedHandle only works with plain SHARED.
-	// SHARED_KEYEDMUTEX returns a null handle from GetSharedHandle, causing Katanga to
-	// get zero from the mapped file and hang in OpenSharedResource. Documented in
-	// Katanga ProjectNotes: Unity also stops drawing entirely when SHARED_KEYEDMUTEX
-	// is used, regardless of mutex state. Bo3b explicitly removed it for this reason.
+	// Plain SHARED — SHARED_KEYEDMUTEX causes GetSharedHandle to return null.
+	// Katanga reads the handle as UINT via *(PUINT)(pMappedView) — needs valid KMT handle.
 	texDesc.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
 
 	if (sharedTexture != NULL) {
@@ -69,10 +66,8 @@ void share_d3d11_texture(ID3D11Texture2D* texture, ID3D11Device* device)
 
 	reshade::log::message(reshade::log::level::info, "GeoVrExport: D3D11 ready");
 
-	// Katanga reads the handle as UINT/DWORD (4 bytes) via *(PUINT)(pMappedView).
-	// KMT handles always fit in 32 bits on x64 (Windows LLP64 model).
-	// Persistent mapping: stays alive across DLL reload so Katanga stays connected.
-	// On reload: CreateFileMapping returns the existing named mapping, value updated in-place.
+		// Persistent mapping: stays alive across DLL reload so KatanaVR stays connected.
+	// On reload: CreateFileMapping returns existing named mapping, value updated in-place.
 	if (!g_katanga_mapping) {
 		g_katanga_mapping = CreateFileMapping(INVALID_HANDLE_VALUE, NULL,
 			PAGE_READWRITE, 0, sizeof(DWORD), L"Local\\KatangaMappedFile");
@@ -129,9 +124,8 @@ void add_copy_command(reshade::api::effect_runtime* runtime, reshade::api::comma
 		if (src.handle != NULL && sharedTexture != NULL) {
 			reshade::api::resource dst;
 			dst.handle = uint64_t(sharedTexture);
-			// No keyed mutex — plain SHARED flag has no mutex support.
-			// flush_immediate_command_list ensures the copy is complete before
-			// Katanga's reader calls OpenSharedResource on the same texture.
+			// No keyed mutex — plain SHARED flag. D3D11 immediate context copy is
+			// synchronous; flush ensures Katanga sees the completed frame.
 			runtime->get_command_queue()->get_immediate_command_list()->copy_resource(src, dst);
 			runtime->get_command_queue()->flush_immediate_command_list();
 		}
