@@ -80,7 +80,7 @@ void share_d3d11_texture(ID3D11Texture2D* texture, ID3D11Device* device)
 }
 
 reshade::api::effect_texture_variable get_vr_texture(reshade::api::effect_runtime* runtime) {
-	auto vrTexture = runtime->find_texture_variable("3DToElse.fx", "V__texTOT");
+	auto vrTexture = runtime->find_texture_variable(nullptr, "V__texTOT"); // nullptr searches all effects regardless of path
 	return vrTexture;
 }
 
@@ -124,10 +124,10 @@ void add_copy_command(reshade::api::effect_runtime* runtime, reshade::api::comma
 		if (src.handle != NULL && sharedTexture != NULL) {
 			reshade::api::resource dst;
 			dst.handle = uint64_t(sharedTexture);
-			// No keyed mutex — plain SHARED flag. D3D11 immediate context copy is
-			// synchronous; flush ensures Katanga sees the completed frame.
+			// No keyed mutex — plain SHARED flag. D3D11 immediate context copy_resource
+			// is synchronous — flush not needed and causes per-frame GPU stalls that
+			// break frame-sequential L/R alternation timing.
 			runtime->get_command_queue()->get_immediate_command_list()->copy_resource(src, dst);
-			runtime->get_command_queue()->flush_immediate_command_list();
 		}
 	}
 }
@@ -143,6 +143,9 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
 		reshade::register_event<reshade::addon_event::reshade_finish_effects>(add_copy_command);
 		break;
 	case DLL_PROCESS_DETACH:
+		if (sharedTexture)    { ((ID3D11Texture2D*)sharedTexture)->Release(); sharedTexture = nullptr; }
+		if (g_katanga_view)   { UnmapViewOfFile(g_katanga_view);  g_katanga_view   = nullptr; }
+		if (g_katanga_mapping){ CloseHandle(g_katanga_mapping);   g_katanga_mapping = nullptr; }
 		reshade::unregister_addon(hModule);
 		break;
 	}

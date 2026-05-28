@@ -80,11 +80,22 @@ def build(vcvars, src, out, inc, arch, env_base):
     return r.returncode
 
 def main():
-    vcvars, src_super, src_geo, bindir, inc_633, inc_latest, has_latest = sys.argv[1:8]
-    has_latest = has_latest.strip() == "1"
+    # Args: vcvars src_super src_geo bindir inc_633 inc_64x inc_67x has_64x has_67x
+    vcvars, src_super, src_geo, bindir, inc_633, inc_64x, inc_67x, has_64x, has_67x = sys.argv[1:10]
+    has_64x = has_64x.strip() == "1"
+    has_67x = has_67x.strip() == "1"
+
+    # Build one output folder per header set that is available.
+    header_sets = [
+        (inc_633, "reshade_6.3.x"),
+    ]
+    if has_64x:
+        header_sets.append((inc_64x, "reshade_6.4.x"))
+    if has_67x:
+        header_sets.append((inc_67x, "reshade_6.7.x"))
 
     configs = []
-    for inc, subfolder in [(inc_633, "reshade_6.3.x")] + ([(inc_latest, "reshade_latest")] if has_latest else []):
+    for inc, subfolder in header_sets:
         outdir = os.path.join(bindir, subfolder)
         for addon, src in [("SuperVrExport", src_super), ("GeoVrExport", src_geo)]:
             for arch, ext in [("x86", "addon32"), ("x64", "addon64")]:
@@ -99,6 +110,7 @@ def main():
         if rc != 0:
             return rc
 
+    folders = "  ".join(f"bin\\{s}\\" for _, s in header_sets)
     print(f"""
 ============================================================
   ALL BUILDS SUCCESSFUL
@@ -106,8 +118,7 @@ def main():
   SuperVrExport  for SuperDepth3D games (SD3D + 3DToElse)
   GeoVrExport    for Geo3D / native frame-sequential games
 
-  bin\\reshade_6.3.x\\   ReShade 6.3.x
-  bin\\reshade_latest\\  ReShade 6.4+
+  {folders}
 
   .addon64 = 64-bit games   .addon32 = 32-bit games
 

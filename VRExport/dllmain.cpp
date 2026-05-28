@@ -199,6 +199,8 @@ static uint32_t g_pbo_h     = 0;
 // Standalone D3D11 device for cross-API bridging
 static ID3D11Device*        g_d3d11_device  = nullptr;
 static ID3D11DeviceContext* g_d3d11_context = nullptr;
+
+// (D3D12 uses ReShade's immediate command list for copies — see add_copy_command)
 // Thread safety: export_effects (reload thread) and add_copy_command (render thread)
 // both touch shared state. Guard with a CRITICAL_SECTION.
 static CRITICAL_SECTION g_cs;
@@ -583,8 +585,11 @@ static void share_d3d10(ID3D10Texture2D* src, ID3D10Device* dev)
 
 static void share_d3d9(IDirect3DTexture9* src, IDirect3DDevice9* dev)
 {
-    // Release previous D3D9 shared tex
-    if (g_d3d9_shared_tex) { g_d3d9_shared_tex->Release(); g_d3d9_shared_tex = nullptr; }
+    // release_shared handles both the surface (sharedTexture) and g_d3d9_shared_tex.
+    // Do NOT release g_d3d9_shared_tex manually here — the surface (sharedTexture) refs
+    // the same memory and release_shared releases the surface first, then the texture.
+    // Releasing the texture first causes use-after-free when release_shared then
+    // releases the surface whose owning texture is already gone.
     release_shared(reshade::api::device_api::d3d9);
 
     IDirect3DDevice9Ex* devEx = nullptr;
@@ -610,6 +615,7 @@ static void share_d3d9(IDirect3DTexture9* src, IDirect3DDevice9* dev)
     sharedTexture = surf;   // copy_resource dst = surface level 0 (same-API copy, valid)
     LOG_INF("SuperVrExport: D3D9 ready");
 }
+
 
 static void share_d3d12(ID3D12Resource* src, ID3D12Device* dev)
 {
@@ -653,13 +659,14 @@ static void share_d3d12(ID3D12Resource* src, ID3D12Device* dev)
     // sharedTexture = D3D12 resource (game device side) used as copy_resource dst.
     // sharedTexture_D3D11 set by create_d3d11_shared (KatanaVR-facing).
     // sharedTextureMutex left as nullptr (set by create_d3d11_shared) — D3D12 uses
-    // plain SHARED so no KeyedMutex is available. add_copy_command will flush instead.
+    // plain SHARED so no KeyedMutex is available.
     sharedTexture = d12;
 
     // Formats always match (D3D11 tex created in src_fmt) — no mismatch possible.
     char rdy[128]; snprintf(rdy, sizeof(rdy),
         "SuperVrExport: D3D12 ready (D3D11 bridge, fmt=0x%X, KMT handle to VRScreenCap)", (unsigned)src_fmt);
     LOG_INF(rdy);
+
 }
 
 static void share_vulkan(reshade::api::resource src_res, reshade::api::device* dev)
@@ -834,9 +841,14 @@ static void share_opengl(GLuint gl_tex, reshade::api::resource src_res,
                 return;
             }
             s_glDeleteMemoryObjectsEXT(1, &mem_obj);
-            // Fall through to next path
+            // Fall through to next path — must clear sharedTexture_D3D11 before releasing d11.
+            // create_d3d11_shared set sharedTexture_D3D11 = d11; releasing d11 without
+            // clearing it leaves sharedTexture_D3D11 dangling → crash on next release_shared.
         }
-        if (d11) d11->Release();
+        if (d11) {
+            if (sharedTexture_D3D11 == static_cast<void*>(d11)) sharedTexture_D3D11 = nullptr;
+            d11->Release();
+        }
         // nt = KMT handle — no CloseHandle
     }
 
@@ -1051,26 +1063,33 @@ void add_copy_command(reshade::api::effect_runtime* rt,
         ? static_cast<uint64_t>(g_vk_image)
         : uint64_t(sharedTexture);
 
+    // ── D3D12 / D3D11 / D3D10 / Vulkan: use ReShade's command list path ────────
+    // We use get_immediate_command_list()->copy_resource() for ALL APIs including D3D12.
+    //
+    // The private copy queue approach was abandoned because D3D12_COMMAND_LIST_TYPE_COPY
+    // queues can only operate on resources already in COMMON/COPY_SOURCE/COPY_DEST state.
+    // texTOT is managed by ReShade on the graphics queue and will be in
+    // PIXEL_SHADER_RESOURCE or RENDER_TARGET state — a COPY queue cannot transition
+    // it to COPY_SOURCE. Attempting CopyResource without the correct barrier causes
+    // silent corruption or device removal.
+    //
+    // generic_depth_mod fires on on_clear_depth_stencil_view, which is mid-frame
+    // rendering — well before on_finish_effects where our copy runs. There is no
+    // overlap: generic_depth is done by the time our copy executes. The original
+    // Alan Wake 2 crash was from flush_immediate_command_list() stalling the GPU
+    // every frame, not from command list sharing with generic_depth.
+    // That flush was removed; no further isolation is needed.
+    //
     // sharedTextureMutex == (IDXGIKeyedMutex*)1 is a sentinel for D3D11/D3D10 plain SHARED:
-    // non-null so flush is skipped, but NOT a real COM object — must not call methods on it.
+    // non-null so AcquireSync is skipped, but NOT a real COM object.
     static const auto kSentinel = reinterpret_cast<IDXGIKeyedMutex*>(1);
     const bool realMutex = (sharedTextureMutex && sharedTextureMutex != kSentinel);
 
     if (realMutex) sharedTextureMutex->AcquireSync(0, 0); // 0ms: non-blocking
 
     rt->get_command_queue()->get_immediate_command_list()->copy_resource(src, dst);
-    // Do NOT flush here for D3D12 (sharedTextureMutex == nullptr).
-    // A per-frame flush_immediate_command_list() is a full CPU-blocked GPU stall —
-    // 60 stalls/sec destroys performance, creates frame-time jitter that breaks
-    // frame-sequential L/R alternation timing, and causes partial writes into the
-    // shared texture visible as square noise blocks in KatanaVR.
-    // The D3D11 bridge texture is on our standalone device; the driver handles
-    // cross-device sync via the shared handle. No per-frame flush needed.
-    // The flush lives only in on_destroy_runtime before releasing the D3D12 resource.
 
     if (realMutex) sharedTextureMutex->ReleaseSync(0);
-
-
 }
 
 // ── Event handlers ─────────────────────────────────────────────────────────────
@@ -1239,6 +1258,9 @@ static void on_destroy_runtime(reshade::api::effect_runtime* rt)
     // configured, contributing to frame-sequential flicker.
     if (g_vr_ready && rt == g_active_runtime) apply_fa_state(rt, false);
     if (g_active_runtime == rt) {
+        // Capture whether we were fully running before resetting.
+        // Used below to decide whether to release the D3D11 bridge device.
+        const bool was_ready = g_vr_ready;
         // Reset g_vr_ready so the next on_reloaded_with_fa re-applies FA state.
         // Without this, g_vr_ready persists true across D3D12 scene transitions:
         // the bridge is torn down but the uniform state (Stereoscopic_Mode, FS_FA)
@@ -1248,11 +1270,15 @@ static void on_destroy_runtime(reshade::api::effect_runtime* rt)
         cs_enter();
         auto api = g_cached_api;
         if (api != reshade::api::device_api::d3d11) {
-            if (api == reshade::api::device_api::d3d12 && sharedTexture)
-                rt->get_command_queue()->flush_immediate_command_list();
             release_shared(api);
             g_src_width = 0; g_src_height = 0; g_src_format = SRC_FORMAT_UNSET;
-            if (api == reshade::api::device_api::d3d12) {
+            if (api == reshade::api::device_api::d3d12 && !was_ready) {
+                // Only release the standalone D3D11 bridge device during the startup
+                // cascade (was_ready==false means we never successfully started).
+                // During gameplay scene transitions (was_ready==true), keep it alive:
+                // RE Engine creates its own D3D11 device mid-transition and releasing
+                // ours causes ref-count conflicts and crashes. ensure_d3d11_device()
+                // will reuse the existing device on the next export_effects call.
                 if (g_d3d11_context) { g_d3d11_context->Release(); g_d3d11_context = nullptr; }
                 if (g_d3d11_device)  { g_d3d11_device->Release();  g_d3d11_device  = nullptr; }
             }
