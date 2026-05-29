@@ -48,18 +48,20 @@ def build(vcvars, src, out, inc, arch, env_base):
 
     os.makedirs(os.path.dirname(out), exist_ok=True)
 
-    # GeoVrExport: strip /GL and /LTCG to keep binary small like the original
+    # GeoVrExport: strip /GL and /LTCG to keep binary small like the original.
+    # /EHsc REQUIRED: the original uses std::stringstream / C++ exceptions.
     if "GeoVrExport" in str(out):
-        cflags = ["/nologo", "/std:c++17", "/O2", "/MD", "/W3",
+        cflags = ["/nologo", "/std:c++17", "/O2", "/EHsc", "/MD", "/W3",
                   "/DWIN32", "/D_WINDOWS", "/DNDEBUG", "/DUNICODE", "/D_UNICODE"]
         lflags = ["/DLL", "/OPT:REF", "/OPT:ICF", "/INCREMENTAL:NO"]
     else:
         cflags = ["/nologo", "/std:c++17", "/O2", "/GL", "/EHsc", "/W3",
                   "/DWIN32", "/D_WINDOWS", "/DNDEBUG", "/DUNICODE", "/D_UNICODE"]
         lflags = ["/DLL", "/OPT:REF", "/OPT:ICF", "/LTCG", "/INCREMENTAL:NO"]
-    # GeoVrExport is D3D11-only like the original — no extra libs needed
+    # GeoVrExport mirrors the ORIGINAL addon, which has BOTH a D3D11 and a D3D12
+    # sharing path — so it needs d3d12.lib too (the original linked it).
     if "GeoVrExport" in str(out):
-        libs = ["kernel32.lib", "user32.lib", "d3d11.lib", "dxgi.lib"]
+        libs = ["kernel32.lib", "user32.lib", "d3d11.lib", "d3d12.lib", "dxgi.lib"]
     else:
         libs = ["kernel32.lib", "user32.lib", "d3d9.lib", "d3d10.lib",
                 "d3d11.lib", "d3d12.lib", "dxgi.lib", "opengl32.lib"]

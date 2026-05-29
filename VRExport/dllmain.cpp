@@ -179,6 +179,11 @@ static uint32_t       g_vk_height        = 0;
 static IDXGIKeyedMutex* sharedTextureMutex  = nullptr;
 static void*            sharedTexture       = nullptr;  // API-specific copy dst
 static void*            sharedTexture_D3D11 = nullptr;  // always D3D11 tex for KatanaVR
+// D3D12 NATIVE path: named NT handle for the "DX12VRStream" shared resource.
+// When non-null, the D3D12 bridge created the shared texture directly on the game's
+// D3D12 device (no D3D11 bridge) and VRScreenCap opens it via OpenSharedHandleByName.
+static HANDLE           g_d3d12_named_handle = nullptr;
+static ID3D12Device*    g_d3d12_native_dev   = nullptr; // D3D12 device our current d3d12 sharedTexture belongs to (native OR bridge)
 // FIX: single persistent file mapping handle (no leak on repeated calls)
 static HANDLE           g_katanga_mapping   = nullptr;
 static DWORD*           g_katanga_view      = nullptr;
@@ -220,8 +225,6 @@ static reshade::api::format g_src_format = SRC_FORMAT_UNSET;
 
 // ── FA / uniform state ────────────────────────────────────────────────────────
 static reshade::api::effect_runtime*         g_active_runtime     = nullptr;
-static bool     g_reload_attempted = false;
-static uint32_t g_reload_count     = 0;   // total reloads fired this session
 static bool     g_vr_ready           = false; // true once DoubleTex + FA found successfully
 static reshade::api::device_api  g_cached_api = reshade::api::device_api::d3d12; // cached API
 static uint32_t                  g_acquiresync_fail_count = 0; // consecutive AcquireSync failures
@@ -313,26 +316,30 @@ static reshade::api::effect_uniform_variable find_sd3d_uniform(
 }
 
 // Uniform handles — set after each compile.
-static reshade::api::effect_uniform_variable g_fs_fa_handle      = { 0 };
-static reshade::api::effect_uniform_variable g_stereo_mode_handle = { 0 };
+static reshade::api::effect_uniform_variable g_fs_fa_handle        = { 0 };
+static reshade::api::effect_uniform_variable g_stereo_mode_handle  = { 0 };
+static reshade::api::effect_uniform_variable g_frame_alt_handle    = { 0 };
+static bool                                  g_frame_alt_parity    = false;
 
 static void apply_fa_state(reshade::api::effect_runtime* rt, bool on)
 {
     if (!on) {
-        // Revert to SBS, FS_FA off
         if (g_stereo_mode_handle.handle) { int32_t m=0; rt->set_uniform_value_int(g_stereo_mode_handle,&m,1); }
         if (g_fs_fa_handle.handle)       { bool f=false; rt->set_uniform_value_bool(g_fs_fa_handle,&f,1); }
         return;
     }
-    if (g_fs_fa_handle.handle) {
-        // Non-VR + EX_DLP_FS_Mode: set Frame Sequential (mode 6) + FS_FA=true
-        // Feeds FS output into 3DToElse which assembles full SBS for KatanaVR.
-        if (g_stereo_mode_handle.handle) { int32_t m=6; rt->set_uniform_value_int(g_stereo_mode_handle,&m,1); }
-        bool fa=true; rt->set_uniform_value_bool(g_fs_fa_handle, &fa, 1);
-    } else if (g_stereo_mode_handle.handle) {
-        // VR mode or DoubleTex-only: ensure SBS (mode 0)
-        int32_t m=0; rt->set_uniform_value_int(g_stereo_mode_handle, &m, 1);
-    }
+    // Stereoscopic_Mode = 0 (Side by Side). With DoubleBuffer_Mode on, SuperDepth3D
+    // writes the full-res SBS image into DoubleTex (BUFFER_WIDTH*2 x BUFFER_HEIGHT)
+    // EVERY frame — both eyes present in one texture, exactly what VRScreenCap's
+    // hardcoded StereoMode::FullSbs expects.
+    //
+    // The DoubleTex SBS-write branch in SuperDepth3D (PS, ~line 7398) only runs when
+    // VR_Stereoscopic_Mode() is 0 or 1. In Frame Sequential mode 6 that branch never
+    // executes, so DoubleTex is left as mono/garbage — which is the broken double-wide
+    // mono image seen in the overlay. Mode 0 is required for DoubleTex to be valid SBS.
+    // FS_FA / Frame_Alternate are not used in this path.
+    if (g_stereo_mode_handle.handle) { int32_t m=0; rt->set_uniform_value_int(g_stereo_mode_handle, &m, 1); }
+    if (g_fs_fa_handle.handle)       { bool f=false; rt->set_uniform_value_bool(g_fs_fa_handle, &f, 1); }
 }
 
 static bool ensure_d3d11_device(IDXGIAdapter* adapter = nullptr)
@@ -379,17 +386,23 @@ static bool ensure_d3d11_device(IDXGIAdapter* adapter = nullptr)
 // FIX: persistent file mapping — create once, update in-place
 static void write_katanga_handle(HANDLE h)
 {
-    // Recreate mapping every call so KatanaVR detects the new handle.
-    // KatanaVR opens KatangaMappedFile by name — closing and recreating
+    // Recreate mapping every call so the consumer detects the new handle.
+    // The consumer opens KatangaMappedFile by name — closing and recreating
     // signals it to re-open and pick up the new D3D resource handle.
+    //
+    // Size = 8 bytes (pointer width). VRScreenCap reads the value as a `usize`
+    // (8 bytes on x64); bo3b Katanga reads only the low 4 bytes as a UINT. Writing
+    // the full 64-bit value with zeroed upper bytes satisfies both: Katanga gets the
+    // low 32-bit KMT handle, VRScreenCap gets the exact pointer-width value.
     if (g_katanga_view)    { UnmapViewOfFile(g_katanga_view);  g_katanga_view    = nullptr; }
     if (g_katanga_mapping) { CloseHandle(g_katanga_mapping);   g_katanga_mapping = nullptr; }
     g_katanga_mapping = CreateFileMapping(INVALID_HANDLE_VALUE, nullptr,
-        PAGE_READWRITE, 0, sizeof(DWORD), L"Local\\KatangaMappedFile");
+        PAGE_READWRITE, 0, sizeof(uint64_t), L"Local\\KatangaMappedFile");
     if (!g_katanga_mapping) return;
     g_katanga_view = reinterpret_cast<DWORD*>(MapViewOfFile(
-        g_katanga_mapping, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(DWORD)));
-    if (g_katanga_view) *g_katanga_view = (DWORD)(uintptr_t)h;
+        g_katanga_mapping, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(uint64_t)));
+    if (g_katanga_view)
+        *reinterpret_cast<uint64_t*>(g_katanga_view) = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(h));
 }
 
 // Forward declaration — defined and initialised here (used in release_shared above share_d3d9).
@@ -410,7 +423,11 @@ static void release_shared(reshade::api::device_api api)
         case reshade::api::device_api::d3d11:
             static_cast<ID3D11Texture2D*>(sharedTexture)->Release(); break;
         case reshade::api::device_api::d3d12:
-            static_cast<ID3D12Resource*>(sharedTexture)->Release(); break;
+            static_cast<ID3D12Resource*>(sharedTexture)->Release();
+            // Native D3D12 path: close the named "DX12VRStream" NT handle.
+            if (g_d3d12_named_handle) { CloseHandle(g_d3d12_named_handle); g_d3d12_named_handle = nullptr; }
+            g_d3d12_native_dev = nullptr;
+            break;
         case reshade::api::device_api::d3d10:
             static_cast<ID3D10Texture2D*>(sharedTexture)->Release(); break;
         case reshade::api::device_api::d3d9:
@@ -433,9 +450,15 @@ static void release_shared(reshade::api::device_api api)
 }
 
 // Create D3D11 shared texture: gets legacy handle for KatanaVR + NT handle for GPU import
+// allow_rtv: when false, omit the RENDER_TARGET bind flag. The shared texture is never
+// rendered to — it is only a copy_resource destination and a shader resource KatanaVR
+// samples. RENDER_TARGET forces a render-target layout which enables DCC (delta color
+// compression) on modern GPUs; DCC must be decompressed on every cross-device/cross-engine
+// access, which is precisely the per-frame cross-device copy the D3D12 bridge performs.
+// Dropping RENDER_TARGET keeps the texture in a plain, directly-shareable layout.
 static ID3D11Texture2D* create_d3d11_shared(
     uint32_t w, uint32_t h, DXGI_FORMAT fmt, HANDLE* out_nt,
-    IDXGIAdapter* adapter = nullptr)
+    IDXGIAdapter* adapter = nullptr, bool allow_rtv = true)
 {
     if (!ensure_d3d11_device(adapter)) return nullptr;
     fmt = dxgi_ensure_typed(fmt);
@@ -443,7 +466,9 @@ static ID3D11Texture2D* create_d3d11_shared(
     D3D11_TEXTURE2D_DESC d = {};
     d.Width = w; d.Height = h; d.MipLevels = 1; d.ArraySize = 1;
     d.Format = fmt; d.SampleDesc = {1,0}; d.Usage = D3D11_USAGE_DEFAULT;
-    d.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    d.BindFlags = allow_rtv
+        ? (D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE)
+        : D3D11_BIND_SHADER_RESOURCE; // copy-dst + KatanaVR SRV only; no RT layout/DCC
     // SHARED only: gives a legacy KMT handle via GetSharedHandle.
     // KMT handle is used for BOTH KatangaMappedFile (VRScreenCap D3D11 path)
     // AND D3D12 OpenSharedHandle (game device import). D3D12 accepts KMT handles.
@@ -617,21 +642,119 @@ static void share_d3d9(IDirect3DTexture9* src, IDirect3DDevice9* dev)
 }
 
 
+// D3D12 NATIVE path (VRScreenCap fast path): create the shared texture directly on the
+// GAME's D3D12 device, named "DX12VRStream", and let VRScreenCap open it by name via
+// ID3D12Device::OpenSharedHandleByName (it imports D3D12 resources as Vulkan external
+// memory with VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE). This eliminates the
+// standalone D3D11 device and the cross-DEVICE copy: the per-frame copy_resource becomes
+// same-device D3D12 -> D3D12. ALLOW_SIMULTANEOUS_ACCESS keeps the resource in COMMON state
+// so a separate process/device can read it concurrently without a keyed mutex — the proper
+// D3D12 mechanism for exactly this producer/consumer pattern, which also avoids the
+// NVIDIA 580.88+ D3D12<->D3D11 cross-process regression entirely (no D3D11 surface involved).
+//
+// VRScreenCap tries D3D11 OpenSharedResource FIRST and only falls back to the D3D12
+// by-name path when that fails. We write the (process-local) NT handle value to
+// KatangaMappedFile: it is not a valid D3D11 KMT handle in VRScreenCap's process, so its
+// D3D11 attempt fails and it falls through to OpenSharedHandleByName("DX12VRStream").
+//
+// Returns true on success. On any failure the caller falls back to the D3D11 bridge,
+// which keeps compatibility with games/drivers that disallow D3D12 shared heaps and with
+// the bo3b Katanga (D3D11-only) consumer.
+static bool share_d3d12_native(ID3D12Resource* src, ID3D12Device* dev)
+{
+    DXGI_FORMAT fmt = dxgi_ensure_typed(src->GetDesc().Format);
+
+    D3D12_HEAP_PROPERTIES hp = {};
+    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+    // Build a clean minimal desc — do NOT copy src->GetDesc().Flags wholesale.
+    // texTOT may carry flags (e.g. ALLOW_UNORDERED_ACCESS, ALLOW_DEPTH_STENCIL, or
+    // engine-specific private flags) that are incompatible with D3D12_HEAP_FLAG_SHARED.
+    // Blindly OR-ing those causes CreateCommittedResource to fail silently (S_OK but
+    // null resource, or E_INVALIDARG) and fall back to the D3D11 bridge.
+    // Instead, start from the source dims/format/layout, then set only the two flags
+    // we actually need: SIMULTANEOUS_ACCESS (shared cross-process read, no mutex) and
+    // ALLOW_RENDER_TARGET (VRScreenCap may sample it as an SRV, needs RT layout compat).
+    D3D12_RESOURCE_DESC srcDesc = src->GetDesc();
+    D3D12_RESOURCE_DESC desc = {};
+    desc.Dimension        = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Alignment        = 0;
+    desc.Width            = srcDesc.Width;
+    desc.Height           = srcDesc.Height;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels        = 1;
+    desc.Format           = fmt; // already resolved to typed by dxgi_ensure_typed above
+    desc.SampleDesc       = {1, 0};
+    desc.Layout           = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    desc.Flags            = D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS
+                          | D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+
+    ID3D12Resource* res = nullptr;
+    HRESULT hr = dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_SHARED, &desc,
+        D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&res));
+    if (FAILED(hr) || !res) {
+        // SIMULTANEOUS_ACCESS + SHARED is rejected by some drivers. Retry without the
+        // simultaneous-access flag (keep render-target): a plain COMMON shared resource
+        // still works as a copy destination via implicit COMMON->COPY_DEST promotion,
+        // and the cross-process consumer reads it via Vulkan external memory.
+        char m1[128]; snprintf(m1, sizeof(m1),
+            "SuperVrExport: D3D12 native CreateCommittedResource(SIMULTANEOUS) hr=0x%08X — retrying plain", (unsigned)hr);
+        LOG_INF(m1);
+        desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        hr = dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_SHARED, &desc,
+            D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&res));
+    }
+    if (FAILED(hr) || !res) {
+        char m2[128]; snprintf(m2, sizeof(m2),
+            "SuperVrExport: D3D12 native shared resource unavailable (hr=0x%08X) — using D3D11 bridge", (unsigned)hr);
+        LOG_INF(m2);
+        return false;
+    }
+
+    HANDLE nt = nullptr;
+    hr = dev->CreateSharedHandle(res, nullptr, GENERIC_ALL, L"DX12VRStream", &nt);
+    if (FAILED(hr) || !nt) {
+        char m3[128]; snprintf(m3, sizeof(m3),
+            "SuperVrExport: D3D12 CreateSharedHandle(DX12VRStream) hr=0x%08X — using D3D11 bridge", (unsigned)hr);
+        LOG_INF(m3);
+        res->Release();
+        return false;
+    }
+
+
+    // Publish to KatangaMappedFile. The value makes VRScreenCap's D3D11 attempt fail so it
+    // falls back to OpenSharedHandleByName("DX12VRStream"). The name carries the resource.
+    write_katanga_handle(nt);
+
+    g_d3d12_named_handle = nt;   // keep open: the name stays registered while the handle lives
+    g_d3d12_native_dev   = dev;  // remember owning device to detect device recreation
+    sharedTexture        = res;  // copy_resource dst (same D3D12 device as texTOT)
+    sharedTexture_D3D11  = nullptr;
+    sharedTextureMutex   = nullptr; // no flush; SIMULTANEOUS_ACCESS handles concurrent read
+
+    char rdy[160]; snprintf(rdy, sizeof(rdy),
+        "SuperVrExport: D3D12 ready (NATIVE same-device, fmt=0x%X, named DX12VRStream to VRScreenCap)",
+        (unsigned)fmt);
+    LOG_INF(rdy);
+    return true;
+}
+
 static void share_d3d12(ID3D12Resource* src, ID3D12Device* dev)
 {
     release_shared(reshade::api::device_api::d3d12);
-    // Reversed bridge: create D3D11 shared tex → open as D3D12 copy dst on the GAME device.
-    // This avoids D3D12_HEAP_FLAG_SHARED which RE Engine (and many D3D12 games) block entirely.
-    // VRScreenCap reads via its D3D11 path using the legacy KMT handle we write to KatangaMappedFile.
+
+    // Fast path: native same-device D3D12 shared texture (VRScreenCap DX12VRStream).
+    if (share_d3d12_native(src, dev)) return;
+
+    // Fallback: reversed D3D11 bridge — create D3D11 shared tex -> open as D3D12 copy dst
+    // on the GAME device. Used when the native D3D12 shared resource can't be created
+    // (driver/game restriction) or for the D3D11-only bo3b Katanga consumer.
+    // VRScreenCap/Katanga read via the D3D11 KMT handle written to KatangaMappedFile.
     if (!ensure_d3d11_device()) { LOG_ERR("SuperVrExport: D3D12 bridge: no D3D11 device"); return; }
 
     D3D12_RESOURCE_DESC rd = src->GetDesc();
     DXGI_FORMAT src_fmt = dxgi_ensure_typed(rd.Format);
 
-    // Create D3D11 shared texture in the SAME format as the source.
-    // D3D11 supports sharing R10G10B10A2_UNORM and most other formats without issue.
-    // Using the native format ensures copy_resource(D3D12_src → D3D12_from_D3D11_dst)
-    // is a same-format copy — valid and produces correct colours in VRScreenCap.
     // Use game D3D12 device's adapter for our standalone D3D11 device.
     // Cross-adapter shared handles (e.g. integrated vs discrete GPU) produce black frames.
     IDXGIDevice* dxgi_dev12 = nullptr;
@@ -641,7 +764,7 @@ static void share_d3d12(ID3D12Resource* src, ID3D12Device* dev)
     }
     HANDLE nt_for_d3d12 = nullptr;
     ID3D11Texture2D* d11 = create_d3d11_shared((UINT)rd.Width, (UINT)rd.Height,
-        src_fmt, &nt_for_d3d12, game_adapter);
+        src_fmt, &nt_for_d3d12, game_adapter, /*allow_rtv=*/false);
     if (game_adapter) { game_adapter->Release(); game_adapter = nullptr; }
     if (!d11) { LOG_ERR("SuperVrExport: D3D12 bridge: create_d3d11_shared failed"); return; }
     if (!nt_for_d3d12) { LOG_ERR("SuperVrExport: D3D12 bridge: KMT handle from D3D11 failed"); return; }
@@ -655,12 +778,8 @@ static void share_d3d12(ID3D12Resource* src, ID3D12Device* dev)
     }
 
     // KatangaMappedFile already written by create_d3d11_shared above.
-
-    // sharedTexture = D3D12 resource (game device side) used as copy_resource dst.
-    // sharedTexture_D3D11 set by create_d3d11_shared (KatanaVR-facing).
-    // sharedTextureMutex left as nullptr (set by create_d3d11_shared) — D3D12 uses
-    // plain SHARED so no KeyedMutex is available.
     sharedTexture = d12;
+    g_d3d12_native_dev = dev; // track owning device so a device recreate forces rebuild
 
     // Formats always match (D3D11 tex created in src_fmt) — no mismatch possible.
     char rdy[128]; snprintf(rdy, sizeof(rdy),
@@ -954,10 +1073,15 @@ reshade::api::effect_texture_variable get_vr_texture(reshade::api::effect_runtim
 {
     if (g_cached_vr_tex.handle != 0 && !g_tex_cache_dirty) return g_cached_vr_tex;
     // Use nullptr effect name to search ALL effects regardless of how ReShade stores the path.
-    auto v = rt->find_texture_variable(nullptr, "V__texTOT");
-    if (v.handle == 0) v = rt->find_texture_variable(nullptr, "V__SuperDepth3D__DoubleTex");
+    // Prefer DoubleTex (SuperDepth3D's direct full SBS output, BUFFER_WIDTH*2 wide) so
+    // 3DToElse can be skipped entirely — DoubleTex already holds both eyes per frame at
+    // full per-eye resolution, which is exactly what VRScreenCap's FullSbs expects and is
+    // higher quality than 3DToElse's screen-res texTOT. texTOT is the fallback for setups
+    // that still run 3DToElse (or Geo3D, where DoubleTex doesn't exist).
+    auto v = rt->find_texture_variable(nullptr, "V__SuperDepth3D__DoubleTex");
     if (v.handle == 0) v = rt->find_texture_variable(nullptr, "V__SuperDepth3DVR__DoubleTex");
     if (v.handle == 0) v = rt->find_texture_variable(nullptr, "V__DoubleTex");
+    if (v.handle == 0) v = rt->find_texture_variable(nullptr, "V__texTOT");
     if (v.handle != 0) { g_cached_vr_tex = v; g_tex_cache_dirty = false; }
     // If search failed but we have a stale cached handle, return it.
     // Better to copy from the old texture than to log "not found" every reload.
@@ -991,6 +1115,18 @@ void export_effects(reshade::api::effect_runtime* rt)
     // Fast non-CS dims check: if already sharing at same resolution, skip setup.
     // This avoids taking the CS on every reload (which causes deadlock when
     // D3D11CreateDevice fires ReShade hooks that try to re-enter export_effects).
+    // If a D3D12 shared resource (native OR bridge) was retained across a runtime
+    // recreate but the D3D12 device itself changed, the retained resource is dead —
+    // force a rebuild so we don't copy into a resource owned by a destroyed device.
+    if (sharedTexture && g_d3d12_native_dev &&
+        rt->get_device()->get_api() == reshade::api::device_api::d3d12 &&
+        reinterpret_cast<ID3D12Device*>(static_cast<uintptr_t>(rt->get_device()->get_native())) != g_d3d12_native_dev) {
+        cs_enter();
+        release_shared(reshade::api::device_api::d3d12);
+        g_src_width = 0; g_src_height = 0; g_src_format = SRC_FORMAT_UNSET;
+        g_d3d12_native_dev = nullptr;
+        cs_leave();
+    }
     if (sharedTexture && src_w == g_src_width && src_h == g_src_height && src_f == g_src_format) return;
     cs_enter();
     // Re-check under CS in case another thread just set up the bridge.
@@ -1063,25 +1199,26 @@ void add_copy_command(reshade::api::effect_runtime* rt,
         ? static_cast<uint64_t>(g_vk_image)
         : uint64_t(sharedTexture);
 
-    // ── D3D12 / D3D11 / D3D10 / Vulkan: use ReShade's command list path ────────
-    // We use get_immediate_command_list()->copy_resource() for ALL APIs including D3D12.
+    // ── Copy path for D3D9/D3D10/D3D11/D3D12/Vulkan ───────────────────────────
+    // copy_resource is recorded on ReShade's immediate command list. Sync regime is
+    // selected by the value of sharedTextureMutex:
     //
-    // The private copy queue approach was abandoned because D3D12_COMMAND_LIST_TYPE_COPY
-    // queues can only operate on resources already in COMMON/COPY_SOURCE/COPY_DEST state.
-    // texTOT is managed by ReShade on the graphics queue and will be in
-    // PIXEL_SHADER_RESOURCE or RENDER_TARGET state — a COPY queue cannot transition
-    // it to COPY_SOURCE. Attempting CopyResource without the correct barrier causes
-    // silent corruption or device removal.
+    //   real mutex  (WGL OpenGL): AcquireSync/ReleaseSync provide cross-device sync.
+    //   sentinel(1) (D3D11/D3D10): plain SHARED, same-device synchronous copy on the
+    //               immediate context. No mutex methods callable.
+    //   nullptr     (D3D12/Vulkan): plain SHARED, no keyed mutex (Katanga's protocol
+    //               needs a 32-bit KMT handle; KEYEDMUTEX would need a 64-bit NT handle).
     //
-    // generic_depth_mod fires on on_clear_depth_stencil_view, which is mid-frame
-    // rendering — well before on_finish_effects where our copy runs. There is no
-    // overlap: generic_depth is done by the time our copy executes. The original
-    // Alan Wake 2 crash was from flush_immediate_command_list() stalling the GPU
-    // every frame, not from command list sharing with generic_depth.
-    // That flush was removed; no further isolation is needed.
-    //
-    // sharedTextureMutex == (IDXGIKeyedMutex*)1 is a sentinel for D3D11/D3D10 plain SHARED:
-    // non-null so AcquireSync is skipped, but NOT a real COM object.
+    // Per-frame flush policy:
+    //   - D3D11/D3D10/D3D9/Vulkan/OpenGL and the D3D12 *bridge* path: NO flush. On the
+    //     cross-device bridge a flush was catastrophic (it drained a cross-device copy
+    //     mid-frame -> latency + jitter). ReShade flushes at Present anyway.
+    //   - D3D12 *native same-device* path (g_d3d12_named_handle != null): flush. This
+    //     matches the original addon, which always flushed. On the native path the copy
+    //     is same-device (texTOT -> our D3D12 resource on the SAME device), so the flush
+    //     just submits a cheap local copy so it completes before VRScreenCap's next
+    //     cross-process read — shrinking the no-mutex tear window that causes flicker.
+    //     This is a fundamentally cheaper flush than the bridge one we removed earlier.
     static const auto kSentinel = reinterpret_cast<IDXGIKeyedMutex*>(1);
     const bool realMutex = (sharedTextureMutex && sharedTextureMutex != kSentinel);
 
@@ -1089,7 +1226,15 @@ void add_copy_command(reshade::api::effect_runtime* rt,
 
     rt->get_command_queue()->get_immediate_command_list()->copy_resource(src, dst);
 
+    // Native D3D12 only: submit the same-device copy now so VRScreenCap reads a complete
+    // frame. g_d3d12_named_handle is non-null only when share_d3d12_native succeeded.
+    if (g_d3d12_named_handle)
+        rt->get_command_queue()->flush_immediate_command_list();
+
     if (realMutex) sharedTextureMutex->ReleaseSync(0);
+
+    // No per-frame Frame_Alternate write: SuperDepth3D is in SBS mode 0, DoubleTex
+    // holds both eyes every frame, so there is no eye to alternate.
 }
 
 // ── Event handlers ─────────────────────────────────────────────────────────────
@@ -1105,21 +1250,17 @@ static void on_init_runtime(reshade::api::effect_runtime* rt)
         g_active_runtime = rt;
         g_cached_api     = rt->get_device()->get_api();
     }
-    // Only reset reload state on a true fresh start (count==0 means never tried).
-    // Do NOT reset g_reload_count here — the reload itself triggers destroy/recreate
-    // cycles, so on_init_runtime fires multiple times during a single reload sequence.
-    // Resetting the count each time bypassed the g_reload_count < 2 guard entirely,
-    // causing an infinite cascade that destabilised frame sequential mode.
-    // g_reload_attempted is reset only when count is 0 (genuine first init).
     if (rt == g_active_runtime) {
-        if (!g_vr_ready && g_reload_count == 0) { g_reload_attempted = false; }
         g_tex_cache_dirty = true;  // invalidate cache on new runtime (race-safe)
         g_cached_api      = rt->get_device()->get_api(); // refresh on recreate
+        // Set SD3D preprocessors on every init so they're in place before the first
+        // compile — even if the user hasn't set them manually. This is safe to call
+        // repeatedly; ReShade only recompiles if the value actually changed.
+        if (!g_vr_ready) {
+            rt->set_preprocessor_definition("EX_DLP_FS_Mode",   "1");
+            rt->set_preprocessor_definition("DoubleBuffer_Mode", "1");
+        }
     }
-    // Preprocessors are set in on_reloaded_with_fa only when texTOT is not found
-    // (i.e. SuperDepth3D pipeline needed). Setting them here causes an immediate
-    // SuperDepth3D recompile that destabilises 3DToElse texTOT on Geo3D games.
-    // Moved to: on_reloaded_with_fa DoubleTex-not-found path.
 }
 
 static void on_reloaded_with_fa(reshade::api::effect_runtime* rt)
@@ -1128,8 +1269,10 @@ static void on_reloaded_with_fa(reshade::api::effect_runtime* rt)
     // If a secondary swapchain reloads, searching it would zero out g_fs_fa_handle
     // (not found there) and disable frame sequential on the main swapchain.
     if (rt != g_active_runtime) return;
-    g_fs_fa_handle      = find_sd3d_uniform(rt, "FS_FA");
-    g_stereo_mode_handle = find_sd3d_uniform(rt, "Stereoscopic_Mode");
+    g_fs_fa_handle        = find_sd3d_uniform(rt, "FS_FA");
+    g_stereo_mode_handle  = find_sd3d_uniform(rt, "Stereoscopic_Mode");
+    g_frame_alt_handle    = find_sd3d_uniform(rt, "Frame_Alternate");
+    g_frame_alt_parity    = false; // reset parity on reload so L is first
     g_tex_cache_dirty  = true;
     // Clear sharedTexture on reload.
     cs_enter();
@@ -1159,36 +1302,34 @@ static void on_reloaded_with_fa(reshade::api::effect_runtime* rt)
     }
     cs_leave();
 
-    if (!g_reload_attempted) {
-        auto vt_check = rt->find_texture_variable(nullptr, "V__texTOT");
-        if (vt_check.handle == 0) vt_check = rt->find_texture_variable(nullptr, "V__SuperDepth3D__DoubleTex");
-        if (vt_check.handle == 0) vt_check = rt->find_texture_variable(nullptr, "V__SuperDepth3DVR__DoubleTex");
-        if (vt_check.handle == 0) vt_check = rt->find_texture_variable(nullptr, "V__DoubleTex");
-        if (vt_check.handle == 0) {
-            if (g_reload_count < 2) {
-                LOG_ERR("SuperVrExport: DoubleTex not found — forcing reload");
-                // Set SD3D preprocessors now — texTOT not present means SD3D pipeline needed.
-                // Doing this here (not on_init) avoids breaking Geo3D games that already have texTOT.
-                rt->set_preprocessor_definition("EX_DLP_FS_Mode",   "1");
-                rt->set_preprocessor_definition("DoubleBuffer_Mode", "1");
-                g_reload_attempted = true; ++g_reload_count; rt->reload_effect_next_frame(nullptr); return;
-            }
-            LOG_ERR("SuperVrExport: DoubleTex still missing — giving up");
-        }
-    }
+    // No reload cascade. texTOT/DoubleTex is always present once SuperDepth3D
+    // compiles — the preprocessors EX_DLP_FS_Mode and DoubleBuffer_Mode are set
+    // by the user and don't need the addon to set them. If texTOT isn't found yet
+    // (runtime just recreated, shaders not assigned yet), just return and wait for
+    // the next reshade_reloaded_effects which fires once shaders are ready.
 
     // export_effects populates g_cached_vr_tex — must run first.
     export_effects(rt);
     // Only apply FA state once DoubleTex is confirmed present.
     // During the reload cascade (DoubleTex not yet found) the runtime is
     // destroyed/recreated immediately after, resetting any uniforms we set here.
-    // Applying mid-cascade causes the FS mode to flicker on/off, which is the
-    // frame sequential instability seen in practice.
+    // Applying mid-cascade causes the FS mode to flicker on/off.
+    //
+    // Mid-session reloads (g_vr_ready already true): RE9 scene transitions fire
+    // reshade_reloaded_effects multiple times in rapid succession. Re-applying
+    // apply_fa_state on every one spams Stereoscopic_Mode writes while the shader
+    // is still mid-recompile, causing the same flicker. Only re-apply if we were
+    // previously not ready (first successful setup) OR if the uniform handles were
+    // refreshed (g_fs_fa_handle may change after a recompile invalidates old handles).
     if (g_cached_vr_tex.handle != 0) {
-        apply_fa_state(rt, true);
+        const bool was_ready = g_vr_ready;
         g_vr_ready        = true;
-        g_reload_count    = 0;     // reset so a future session can retry from scratch
-        g_reload_attempted = false; // reset so a shader reload that loses DoubleTex can retry
+        // Apply FA state on first successful setup, or after a runtime destroy/recreate
+        // that clears g_vr_ready. Do NOT re-apply on every mid-session recompile —
+        // that spams mode writes while the shader is unstable.
+        if (!was_ready) {
+            apply_fa_state(rt, true);
+        }
     }
 }
 
@@ -1211,7 +1352,6 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
         reshade::register_event<reshade::addon_event::reshade_finish_effects>(on_finish_effects_with_fa);
         break;
     case DLL_PROCESS_DETACH:
-        g_reload_count = 0;
         g_vr_ready = false;
         if (g_active_runtime) apply_fa_state(g_active_runtime, false);
         if (g_d3d9_shared_tex) { g_d3d9_shared_tex->Release(); g_d3d9_shared_tex = nullptr; }
@@ -1228,6 +1368,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
             && sharedTexture != reinterpret_cast<void*>(static_cast<uintptr_t>(1u))) {
             static_cast<IUnknown*>(sharedTexture)->Release();
         }
+        if (g_d3d12_named_handle) { CloseHandle(g_d3d12_named_handle); g_d3d12_named_handle = nullptr; }
         // Do NOT close KatangaMappedFile on DLL unload.
         // Keeping it alive means reload finds the existing mapping,
         // so KatanaVR stays connected. OS cleans up at process exit.
@@ -1258,9 +1399,6 @@ static void on_destroy_runtime(reshade::api::effect_runtime* rt)
     // configured, contributing to frame-sequential flicker.
     if (g_vr_ready && rt == g_active_runtime) apply_fa_state(rt, false);
     if (g_active_runtime == rt) {
-        // Capture whether we were fully running before resetting.
-        // Used below to decide whether to release the D3D11 bridge device.
-        const bool was_ready = g_vr_ready;
         // Reset g_vr_ready so the next on_reloaded_with_fa re-applies FA state.
         // Without this, g_vr_ready persists true across D3D12 scene transitions:
         // the bridge is torn down but the uniform state (Stereoscopic_Mode, FS_FA)
@@ -1269,19 +1407,48 @@ static void on_destroy_runtime(reshade::api::effect_runtime* rt)
         g_active_runtime = nullptr;
         cs_enter();
         auto api = g_cached_api;
-        if (api != reshade::api::device_api::d3d11) {
+        // D3D11 and D3D12-native: do NOT release the shared resource on destroy.
+        // The runtime is frequently destroyed/recreated at the SAME resolution by
+        // events that have nothing to do with the swapchain — enabling a virtual
+        // controller, scene transitions, alt-tab. Tearing down the native D3D12
+        // shared resource here would close the named "DX12VRStream" handle, but
+        // VRScreenCap still holds that name open, so the subsequent recreate's
+        // CreateSharedHandle("DX12VRStream") FAILS (name still referenced) and the
+        // addon falls back to the D3D11 bridge with a different KMT handle —
+        // breaking Katanga's connection. Keep the native resource + named handle
+        // alive across the recreate; export_effects' dimension check reuses it if
+        // the resolution is unchanged, or calls release_shared itself if it changed.
+        // Keep-alive policy across a runtime destroy/recreate (controller toggle,
+        // alt-tab, scene transition — none of which change resolution):
+        //
+        // The texture KatangaVR/VRScreenCap actually reads is, for several APIs, owned
+        // by OUR resources (the native D3D12 shared resource, or a texture on our
+        // standalone D3D11 bridge device) — NOT by the game's runtime. Those survive a
+        // runtime recreate intact, so releasing them here only churns the KatangaMappedFile
+        // handle and drops the VR connection. Keep them; export_effects' dimension check
+        // reuses them at the same resolution or rebuilds if it actually changed.
+        //
+        //   d3d11        : Katanga texture on game device, survives ResizeBuffers   -> keep
+        //   d3d12 native : our shared resource + named "DX12VRStream" handle        -> keep
+        //   d3d12 bridge : Katanga texture on our standalone D3D11 device           -> keep
+        //   d3d9         : game-side surface tied to game D3D9 device (recreated)    -> release
+        //   vulkan       : g_vk_image lives on the game's VK device (recreated)     -> release
+        //   opengl       : interop objects tied to the GL context (recreated)       -> release
+        //   d3d10        : Katanga texture on the game's D3D10 device               -> release
+        const bool keepAlive =
+            api == reshade::api::device_api::d3d11 ||
+            (api == reshade::api::device_api::d3d12); // native OR bridge: Katanga side is ours
+        // D3D9 is intentionally NOT kept alive: its game-side surface (g_d3d9_shared_tex)
+        // is tied to the game's D3D9 device and is released below regardless, so the
+        // Katanga chain must be rebuilt. D3D10/Vulkan/OpenGL rebuild for similar reasons
+        // (game-device or context-bound objects).
+
+        if (keepAlive) {
+            // Intentionally keep sharedTexture / sharedTexture_D3D11 / g_d3d12_named_handle
+            // and g_src_* intact so Katanga never sees the handle change.
+        } else {
             release_shared(api);
             g_src_width = 0; g_src_height = 0; g_src_format = SRC_FORMAT_UNSET;
-            if (api == reshade::api::device_api::d3d12 && !was_ready) {
-                // Only release the standalone D3D11 bridge device during the startup
-                // cascade (was_ready==false means we never successfully started).
-                // During gameplay scene transitions (was_ready==true), keep it alive:
-                // RE Engine creates its own D3D11 device mid-transition and releasing
-                // ours causes ref-count conflicts and crashes. ensure_d3d11_device()
-                // will reuse the existing device on the next export_effects call.
-                if (g_d3d11_context) { g_d3d11_context->Release(); g_d3d11_context = nullptr; }
-                if (g_d3d11_device)  { g_d3d11_device->Release();  g_d3d11_device  = nullptr; }
-            }
         }
         if (g_d3d9_shared_tex) { g_d3d9_shared_tex->Release(); g_d3d9_shared_tex = nullptr; }
         g_vk_width  = 0; g_vk_height  = 0;

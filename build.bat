@@ -2,8 +2,8 @@
 :: ============================================================================
 ::  build.bat  -  Build SuperVrExport and GeoVrExport addons
 ::
-::  SuperVrExport  — SuperDepth3D games (SD3D + 3DToElse + full FS pipeline)
-::  GeoVrExport    — Geo3D / native frame-sequential games (3DToElse only)
+::  SuperVrExport  - SuperDepth3D games (SD3D + 3DToElse + full FS pipeline)
+::  GeoVrExport    - Geo3D / native frame-sequential games (3DToElse only)
 ::
 ::  Requirements: Visual Studio 2019 or 2022 with C++ Desktop workload
 ::

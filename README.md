@@ -41,14 +41,12 @@ Both addons hook into ReShade's effect pipeline and share the stereo 3D frame wi
 ### SuperVrExport pipeline (SuperDepth3D games)
 
 ```
-SuperDepth3D (Frame Sequential mode, configured automatically)
-        │  alternating L/R full-frame output each frame
-        ▼
-3DToElse.fx (Frame Sequential input, set by user once)
-        │  reconstructs current + previous frame into full SBS (texTOT)
+SuperDepth3D (Side by Side mode + Double Buffer, configured automatically)
+        │  writes the full-res SBS image into DoubleTex every frame
+        │  (DoubleTex = BUFFER_WIDTH×2 — both eyes, full per-eye resolution)
         ▼
 SuperVrExport addon
-        │  copies texTOT to a shared GPU texture each frame
+        │  copies DoubleTex directly to a shared GPU texture each frame
         ▼
 KatangaMappedFile  ←  KatanaVR / VRScreenCap reads this handle
         ▼
@@ -59,10 +57,23 @@ KatangaMappedFile  ←  KatanaVR / VRScreenCap reads this handle
 
 | Preprocessor / Uniform | Value | Why |
 |---|---|---|
-| `EX_DLP_FS_Mode` | `1` | Adds Frame Sequential (mode 6) to SuperDepth3D's Stereoscopic Mode dropdown |
-| `DoubleBuffer_Mode` | `1` | Creates the DoubleTex buffer as a direct SBS source |
-| `Stereoscopic_Mode` | `6` (Frame Sequential) | Set automatically after compile |
-| `FS_FA` | `true` | Enables addon-driven frame alternation |
+| `EX_DLP_FS_Mode` | `1` | Set once at startup so SuperDepth3D's extended modes are available |
+| `DoubleBuffer_Mode` | `1` | Creates `DoubleTex` — the full-res SBS texture the addon copies |
+| `Stereoscopic_Mode` | `0` (Side by Side) | Required so SuperDepth3D writes a valid SBS image into `DoubleTex` (the DoubleTex write path only runs in SBS mode) |
+
+> Both preprocessors are set automatically at startup before the first shader
+> compile, so they are always in place even if you haven't set them manually.
+
+#### What changed in SuperVrExport
+
+| Change | Detail |
+|---|---|
+| **Direct `DoubleTex` copy** | The addon now copies SuperDepth3D's `DoubleTex` (full-res SBS) straight to KatanaVR. **3DToElse and Frame Sequential mode are no longer used** — this removes the frame-sequential timing flicker and increases per-eye resolution. `texTOT` remains an automatic fallback. |
+| **SBS mode (0) instead of Frame Sequential (6)** | `DoubleTex` is only written as a valid SBS image when SuperDepth3D is in Side-by-Side mode, so the addon sets `Stereoscopic_Mode = 0`. `FS_FA` / frame alternation are not used. |
+| **Preprocessors set at startup** | `EX_DLP_FS_Mode` and `DoubleBuffer_Mode` are applied once in `init_runtime` before the first compile. The old "DoubleTex not found → forcing reload" recompile cascade has been **removed entirely** — no more reload churn or mid-session mode resets. |
+| **Connection survives runtime recreates** | Enabling a virtual controller, alt-tabbing, or scene transitions trigger a runtime destroy/recreate. The shared resource and `KatangaMappedFile` handle are now **kept alive** across these on D3D11 and D3D12 (native + bridge), so KatanaVR no longer drops the connection. A device-change guard rebuilds correctly if the GPU device is genuinely recreated. |
+| **Native D3D12 same-device path** | When possible the addon shares a same-device D3D12 resource (named `DX12VRStream`) with zero cross-device copy, falling back to the D3D11 bridge only when the driver rejects the native path. |
+
 
 ### GeoVrExport pipeline (Geo3D mod games)
 
@@ -91,7 +102,7 @@ GeoVrExport sets **nothing automatically** — it simply reads the existing texT
 |---|---|
 | **ReShade** | 6.3.x or newer, installed in **DXGI proxy mode** (`dxgi.dll`) for D3D12 games |
 | **SuperDepth3D.fx** | v5.3.8 or newer — **SuperVrExport only.** Must include `EX_DLP_FS_Mode` and `DoubleBuffer_Mode` preprocessors |
-| **3DToElse.fx** | Required for both addons. Included in the `Effects/` folder |
+| **3DToElse.fx** | **GeoVrExport only.** Not required for SuperVrExport (which reads `DoubleTex` directly). Included in the `Effects/` folder |
 | **KatanaVR / VRScreenCap** | 0.4.0-dev5 or newer. Must be started **after** the game |
 | **OS** | Windows 10 2004+ or Windows 11 |
 
@@ -105,28 +116,27 @@ Download [ReShade](https://reshade.me) and install it for your game selecting th
 
 ### 2 — Copy shader files
 
-Copy **`SuperDepth3D.fx`** (v5.3.8+) and **`3DToElse.fx`** into your `reshade-shaders\Shaders\` folder and enable both techniques in the ReShade overlay.
-
-> **Technique order matters:** `SuperDepth3D` must appear **before** `To_Else` in the technique list.
+Copy **`SuperDepth3D.fx`** (v5.3.8+) into your `reshade-shaders\Shaders\` folder and enable the **SuperDepth3D** technique in the ReShade overlay.
 
 ### 3 — Install the addon
 
 Copy **`SuperVrExport.addon64`** to the same folder as `dxgi.dll`. ReShade automatically loads all `.addon64` files from that directory.
 
-### 4 — Configure 3DToElse
+### 4 — That's it for configuration
 
-Open the ReShade overlay, select the **To_Else** technique, and set:
+There is **nothing to configure manually.** On launch the addon automatically sets
+SuperDepth3D to **Side by Side** mode with **Double Buffer** enabled, so `DoubleTex`
+holds a full-res SBS image every frame. Just tune your SuperDepth3D depth/3D settings
+to taste as normal.
 
-| Setting | Value |
-|---|---|
-| **Stereoscopic Mode Input** | **Frame Sequential** (index 5) |
-| **3D Display Mode** | **Side by Side** (index 0) |
-
-> The addon automatically sets SuperDepth3D to Frame Sequential mode — you only need to configure the 3DToElse input side.
+> Because SuperDepth3D is in SBS mode, your flat monitor will show a squished
+> side-by-side image — that is expected. KatanaVR receives the correct full-res SBS.
 
 ### 5 — Launch the game
 
-Start the game. Within 2–3 seconds the addon will configure Frame Sequential mode and write the shared handle to `KatangaMappedFile`.
+Start the game. Within 2–3 seconds the addon writes the shared handle to
+`KatangaMappedFile`. Look for `SuperVrExport: D3D12 ready` (or `D3D11 ready`) in
+`ReShade.log`.
 
 ### 6 — Start KatanaVR / VRScreenCap
 
@@ -196,9 +206,10 @@ Direct3D 9 games require an extra step because D3D9's shared texture support is 
 |---|---|
 | KatanaVR shows nothing | Restart KatanaVR **after** the game loads. Check `ReShade.log` for `D3D11 ready` / `D3D12 ready` |
 | Black screen in headset | Confirm `first copy fired` in `ReShade.log`. Restart KatanaVR |
+| Flat monitor shows squished side-by-side | Expected — SuperVrExport runs SuperDepth3D in SBS mode so `DoubleTex` is valid. KatanaVR still receives correct full-res SBS |
+| `DoubleTex` looks mono / stretched in the overlay preview | The addon forces SBS mode automatically; if you manually changed `Stereoscopic_Mode` away from Side by Side, `DoubleTex` stops being valid SBS. Leave the mode alone |
 | D3D9 game: black / no connection | Use dgVoodoo2 to translate D3D9 → D3D11. See section above |
 | Addon not in ReShade list | Ensure `.addon64` is next to `dxgi.dll`; reinstall ReShade with "Install add-ons" checked |
-| `DoubleTex not found` loop | Normal on first launch of SuperVrExport — resolves within 3 seconds |
 | Game crashes with SuperVrExport | Confirm the game uses SuperDepth3D. For native Geo3D games use GeoVrExport instead |
 | Game crashes with GeoVrExport | Confirm the [Geo3D mod](https://github.com/Flugan/Geo3D-Installer) is installed, 3DToElse is enabled, and Stereoscopic Mode Input is set to Frame Sequential |
 
@@ -206,11 +217,11 @@ Direct3D 9 games require an extra step because D3D9's shared texture support is 
 
 | Message | Meaning |
 |---|---|
-| `SuperVrExport: D3D12 ready` | Bridge established — start KatanaVR now |
+| `SuperVrExport: D3D12 ready (NATIVE same-device...)` | Best path — same-device D3D12 share. Start KatanaVR now |
+| `SuperVrExport: D3D12 ready (D3D11 bridge...)` | Working via the D3D11 bridge. Start KatanaVR now |
 | `SuperVrExport: D3D11 ready` | Bridge established — start KatanaVR now |
 | `GeoVrExport: D3D11 ready` | Bridge established — start KatanaVR now |
 | `first copy fired, src=... dst=...` | GPU copy is working |
-| `DoubleTex not found — forcing reload` | SuperVrExport startup — normal, triggers one shader recompile |
 
 ---
 
