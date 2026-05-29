@@ -28,9 +28,9 @@
 | Addon | Use for |
 |---|---|
 | **`SuperVrExport.addon64`** | Games using **[SuperDepth3D](https://github.com/BlueSkyDefender/Depth3D)** to generate stereo |
-| **`GeoVrExport.addon64`** | Games using the **[Geo3D mod](https://github.com/Flugan/Geo3D-Installer)** for stereoscopic output (3DToElse only, no SuperDepth3D) |
+| **`GeoVrExport.addon64`** | Games using the **[Geo-3D](https://github.com/Flugan/Geo3D-Installer)** for stereoscopic output (3DToElse only, no SuperDepth3D) |
 
-**Not sure?** If you are adding stereoscopic 3D to a game yourself using the **[SuperDepth3D](https://github.com/BlueSkyDefender/Depth3D)** shader, use **SuperVrExport**. If you are using the **[Geo3D mod](https://github.com/Flugan/Geo3D-Installer)** to inject stereo into a D3D11 game, use **GeoVrExport**.
+**Not sure?** If you are adding stereoscopic 3D to a game yourself using the **[SuperDepth3D](https://github.com/BlueSkyDefender/Depth3D)** shader, use **SuperVrExport**. If you are using the **[Geo-3D](https://github.com/Flugan/Geo3D-Installer)** to inject stereo into a D3D11 game, use **GeoVrExport**.
 
 ---
 
@@ -75,10 +75,10 @@ KatangaMappedFile  ←  KatanaVR / VRScreenCap reads this handle
 | **Native D3D12 same-device path** | When possible the addon shares a same-device D3D12 resource (named `DX12VRStream`) with zero cross-device copy, falling back to the D3D11 bridge only when the driver rejects the native path. |
 
 
-### GeoVrExport pipeline (Geo3D mod games)
+### GeoVrExport pipeline (Geo-3D games)
 
 ```
-Geo3D mod (injects frame-sequential stereo into D3D11 games)
+Geo-3D (injects frame-sequential stereo into D3D11 games)
         │  alternating L/R full-frame output each frame
         ▼
 3DToElse.fx (Frame Sequential input, set by user once)
@@ -92,7 +92,7 @@ KatangaMappedFile  ←  KatanaVR / VRScreenCap reads this handle
  KatanaVR  →  VR headset (full resolution SBS)
 ```
 
-GeoVrExport sets **nothing automatically** — it simply reads the existing texTOT output from 3DToElse and shares it. No SuperDepth3D required. The Geo3D mod handles stereo generation independently.
+GeoVrExport sets **nothing automatically** — it simply reads the existing texTOT output from 3DToElse and shares it. No SuperDepth3D required. Geo-3D handles stereo generation independently.
 
 ---
 
@@ -146,13 +146,13 @@ Launch the viewer **after** the game has loaded. It reads `KatangaMappedFile` an
 
 ---
 
-## 🚀 Setup — GeoVrExport (Geo3D mod games)
+## 🚀 Setup — GeoVrExport (Geo-3D games)
 
 ### 1 — Install ReShade
 
 Download [ReShade](https://reshade.me) and install it for your game selecting the **DXGI** API.
 
-### 2 — Install the Geo3D mod
+### 2 — Install Geo-3D
 
 Download and run the [Geo3D installer](https://github.com/Flugan/Geo3D-Installer) for your game. This injects the stereo frame-sequential output that GeoVrExport reads.
 
@@ -211,7 +211,7 @@ Direct3D 9 games require an extra step because D3D9's shared texture support is 
 | D3D9 game: black / no connection | Use dgVoodoo2 to translate D3D9 → D3D11. See section above |
 | Addon not in ReShade list | Ensure `.addon64` is next to `dxgi.dll`; reinstall ReShade with "Install add-ons" checked |
 | Game crashes with SuperVrExport | Confirm the game uses SuperDepth3D. For native Geo3D games use GeoVrExport instead |
-| Game crashes with GeoVrExport | Confirm the [Geo3D mod](https://github.com/Flugan/Geo3D-Installer) is installed, 3DToElse is enabled, and Stereoscopic Mode Input is set to Frame Sequential |
+| Game crashes with GeoVrExport | Confirm the [Geo-3D](https://github.com/Flugan/Geo3D-Installer) is installed, 3DToElse is enabled, and Stereoscopic Mode Input is set to Frame Sequential |
 
 ### Reading ReShade.log
 
