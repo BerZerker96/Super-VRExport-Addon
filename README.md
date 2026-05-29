@@ -27,10 +27,10 @@
 
 | Addon | Use for |
 |---|---|
-| **`SuperVrExport.addon64`** | Games using **SuperDepth3D** to generate stereo (SD3D + 3DToElse) |
+| **`SuperVrExport.addon64`** | Games using **[SuperDepth3D](https://github.com/BlueSkyDefender/Depth3D)** to generate stereo |
 | **`GeoVrExport.addon64`** | Games using the **[Geo3D mod](https://github.com/Flugan/Geo3D-Installer)** for stereoscopic output (3DToElse only, no SuperDepth3D) |
 
-**Not sure?** If you are adding stereoscopic 3D to a game yourself using the SuperDepth3D shader, use **SuperVrExport**. If you are using the **[Geo3D mod](https://github.com/Flugan/Geo3D-Installer)** to inject stereo into a D3D11 game, use **GeoVrExport**.
+**Not sure?** If you are adding stereoscopic 3D to a game yourself using the **[SuperDepth3D](https://github.com/BlueSkyDefender/Depth3D)** shader, use **SuperVrExport**. If you are using the **[Geo3D mod](https://github.com/Flugan/Geo3D-Installer)** to inject stereo into a D3D11 game, use **GeoVrExport**.
 
 ---
 
@@ -101,7 +101,7 @@ GeoVrExport sets **nothing automatically** — it simply reads the existing texT
 | Component | Version / Notes |
 |---|---|
 | **ReShade** | 6.3.x or newer, installed in **DXGI proxy mode** (`dxgi.dll`) for D3D12 games |
-| **SuperDepth3D.fx** | v5.3.8 or newer — **SuperVrExport only.** Must include `EX_DLP_FS_Mode` and `DoubleBuffer_Mode` preprocessors |
+| **[SuperDepth3D.fx](https://github.com/BlueSkyDefender/Depth3D)** | v5.3.8 or newer — **SuperVrExport only.** Must include `EX_DLP_FS_Mode` and `DoubleBuffer_Mode` preprocessors |
 | **3DToElse.fx** | **GeoVrExport only.** Not required for SuperVrExport (which reads `DoubleTex` directly). Included in the `Effects/` folder |
 | **KatanaVR / VRScreenCap** | 0.4.0-dev5 or newer. Must be started **after** the game |
 | **OS** | Windows 10 2004+ or Windows 11 |
@@ -116,7 +116,7 @@ Download [ReShade](https://reshade.me) and install it for your game selecting th
 
 ### 2 — Copy shader files
 
-Copy **`SuperDepth3D.fx`** (v5.3.8+) into your `reshade-shaders\Shaders\` folder and enable the **SuperDepth3D** technique in the ReShade overlay.
+Copy **[`SuperDepth3D.fx`](https://github.com/BlueSkyDefender/Depth3D)** (v5.3.8+) into your `reshade-shaders\Shaders\` folder and enable the **SuperDepth3D** technique in the ReShade overlay.
 
 ### 3 — Install the addon
 

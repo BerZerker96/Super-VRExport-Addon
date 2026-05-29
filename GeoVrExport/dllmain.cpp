@@ -15,6 +15,17 @@ extern "C" __declspec(dllexport) const char* DESCRIPTION = "Export Geo3D stereo 
 static IDXGIKeyedMutex* sharedTextureMutex;
 static void* sharedTexture;
 
+// Copy-completion fence (D3D12 path). The D3D12 shared resource uses
+// ALLOW_SIMULTANEOUS_ACCESS with no keyed mutex, and VRScreenCap samples it live
+// without acquiring on its side, so without this the consumer can read a half-written
+// copy_resource (slight flicker, worse under GPU load). A queue-ordered ID3D12Fence
+// Signal + bounded host wait makes the copy GPU-complete before the next frame
+// overwrites it. Scoped to the copy, not a full wait_idle() drain. Best-effort.
+static ID3D12Fence* g_d3d12_copy_fence  = nullptr;
+static HANDLE       g_d3d12_fence_event = nullptr;
+static UINT64       g_d3d12_fence_value = 0;
+static bool         g_geo_is_d3d12      = false; // true once the D3D12 path is active
+
 void share_d3d11_texture(ID3D11Texture2D* texture, ID3D11Device* device)
 {
 	D3D11_TEXTURE2D_DESC texDesc;
@@ -181,6 +192,18 @@ void share_d3d12_texture(ID3D12Resource* texture, ID3D12Device* device)
 
 	*sharedResourceHandle = sharedHandle;
 	sharedTexture = stereoSharedBuffer;
+	g_geo_is_d3d12 = true;
+
+	// Create the copy-completion fence + event (best-effort; copy still works without it).
+	if (g_d3d12_copy_fence == nullptr) {
+		if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_d3d12_copy_fence)))) {
+			g_d3d12_copy_fence = nullptr;
+		} else {
+			g_d3d12_fence_value = 0;
+			if (g_d3d12_fence_event == nullptr)
+				g_d3d12_fence_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+		}
+	}
 }
 
 reshade::api::effect_texture_variable get_vr_texture(reshade::api::effect_runtime* runtime) {
@@ -243,6 +266,25 @@ void add_copy_command(reshade::api::effect_runtime* runtime, reshade::api::comma
 			runtime->get_command_queue()->get_immediate_command_list()->copy_resource(src, dst);
 			runtime->get_command_queue()->flush_immediate_command_list();
 
+			// D3D12 path: wait until the copy is GPU-complete so VRScreenCap (which samples
+			// the shared texture live, no acquire on its side) never reads a half-written
+			// copy. Queue-ordered fence Signal + bounded host wait, scoped to the copy.
+			// Bounded 8ms timeout prevents any hang if the GPU is saturated. Best-effort.
+			if (g_geo_is_d3d12 && g_d3d12_copy_fence != NULL && g_d3d12_fence_event != NULL) {
+				ID3D12CommandQueue* q = reinterpret_cast<ID3D12CommandQueue*>(
+					static_cast<uintptr_t>(runtime->get_command_queue()->get_native()));
+				if (q != NULL) {
+					const UINT64 target = ++g_d3d12_fence_value;
+					if (SUCCEEDED(q->Signal(g_d3d12_copy_fence, target))) {
+						if (g_d3d12_copy_fence->GetCompletedValue() < target) {
+							if (SUCCEEDED(g_d3d12_copy_fence->SetEventOnCompletion(target, g_d3d12_fence_event))) {
+								WaitForSingleObject(g_d3d12_fence_event, 8);
+							}
+						}
+					}
+				}
+			}
+
 			if (sharedTextureMutex != NULL)
 				sharedTextureMutex->ReleaseSync(0);
 		}
@@ -260,6 +302,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
 		reshade::register_event<reshade::addon_event::reshade_finish_effects>(add_copy_command);
 		break;
 	case DLL_PROCESS_DETACH:
+		if (g_d3d12_copy_fence)  { g_d3d12_copy_fence->Release(); g_d3d12_copy_fence = nullptr; }
+		if (g_d3d12_fence_event) { CloseHandle(g_d3d12_fence_event); g_d3d12_fence_event = nullptr; }
 		reshade::unregister_addon(hModule);
 		break;
 	}

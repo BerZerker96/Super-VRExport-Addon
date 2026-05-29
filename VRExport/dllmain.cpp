@@ -184,6 +184,17 @@ static void*            sharedTexture_D3D11 = nullptr;  // always D3D11 tex for 
 // D3D12 device (no D3D11 bridge) and VRScreenCap opens it via OpenSharedHandleByName.
 static HANDLE           g_d3d12_named_handle = nullptr;
 static ID3D12Device*    g_d3d12_native_dev   = nullptr; // D3D12 device our current d3d12 sharedTexture belongs to (native OR bridge)
+
+// Copy-completion fence (native D3D12 path only). VRScreenCap samples the shared
+// texture live with NO keyed mutex / no acquire on its side (confirmed in
+// katanga_loader.rs — it OpenSharedHandleByName + samples, never AcquireSync), so the
+// only way to stop it reading a half-written copy_resource is to make the producer
+// wait until the copy is GPU-complete before the next frame overwrites it. A real
+// queue-ordered ID3D12Fence (Signal on the queue, bounded host wait) does this; it is
+// scoped to the copy, not a full wait_idle() drain.
+static ID3D12Fence*     g_d3d12_copy_fence   = nullptr;
+static HANDLE           g_d3d12_fence_event  = nullptr;
+static UINT64           g_d3d12_fence_value  = 0;
 // FIX: single persistent file mapping handle (no leak on repeated calls)
 static HANDLE           g_katanga_mapping   = nullptr;
 static DWORD*           g_katanga_view      = nullptr;
@@ -318,8 +329,6 @@ static reshade::api::effect_uniform_variable find_sd3d_uniform(
 // Uniform handles — set after each compile.
 static reshade::api::effect_uniform_variable g_fs_fa_handle        = { 0 };
 static reshade::api::effect_uniform_variable g_stereo_mode_handle  = { 0 };
-static reshade::api::effect_uniform_variable g_frame_alt_handle    = { 0 };
-static bool                                  g_frame_alt_parity    = false;
 
 static void apply_fa_state(reshade::api::effect_runtime* rt, bool on)
 {
@@ -427,6 +436,10 @@ static void release_shared(reshade::api::device_api api)
             // Native D3D12 path: close the named "DX12VRStream" NT handle.
             if (g_d3d12_named_handle) { CloseHandle(g_d3d12_named_handle); g_d3d12_named_handle = nullptr; }
             g_d3d12_native_dev = nullptr;
+            // Release the copy-completion fence + event (recreated on next native share).
+            if (g_d3d12_copy_fence) { g_d3d12_copy_fence->Release(); g_d3d12_copy_fence = nullptr; }
+            if (g_d3d12_fence_event) { CloseHandle(g_d3d12_fence_event); g_d3d12_fence_event = nullptr; }
+            g_d3d12_fence_value = 0;
             break;
         case reshade::api::device_api::d3d10:
             static_cast<ID3D10Texture2D*>(sharedTexture)->Release(); break;
@@ -731,6 +744,19 @@ static bool share_d3d12_native(ID3D12Resource* src, ID3D12Device* dev)
     sharedTexture        = res;  // copy_resource dst (same D3D12 device as texTOT)
     sharedTexture_D3D11  = nullptr;
     sharedTextureMutex   = nullptr; // no flush; SIMULTANEOUS_ACCESS handles concurrent read
+
+    // Create the copy-completion fence + event (best-effort; copy still works without it,
+    // just without the tear-window guarantee). Reuse across recreates if already present.
+    if (!g_d3d12_copy_fence) {
+        if (FAILED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE,
+                                    IID_PPV_ARGS(&g_d3d12_copy_fence)))) {
+            g_d3d12_copy_fence = nullptr; // proceed unsynchronized rather than fail the share
+        } else {
+            g_d3d12_fence_value = 0;
+            if (!g_d3d12_fence_event)
+                g_d3d12_fence_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        }
+    }
 
     char rdy[160]; snprintf(rdy, sizeof(rdy),
         "SuperVrExport: D3D12 ready (NATIVE same-device, fmt=0x%X, named DX12VRStream to VRScreenCap)",
@@ -1228,13 +1254,36 @@ void add_copy_command(reshade::api::effect_runtime* rt,
 
     // Native D3D12 only: submit the same-device copy now so VRScreenCap reads a complete
     // frame. g_d3d12_named_handle is non-null only when share_d3d12_native succeeded.
-    if (g_d3d12_named_handle)
+    if (g_d3d12_named_handle) {
         rt->get_command_queue()->flush_immediate_command_list();
 
-    if (realMutex) sharedTextureMutex->ReleaseSync(0);
+        // Close the tear window: wait until the copy is GPU-complete before returning,
+        // so VRScreenCap (which samples the shared texture live, with no acquire on its
+        // side) never catches a half-written copy. This is a queue-ordered ID3D12Fence
+        // Signal + bounded host wait — scoped to the copy, NOT a full wait_idle() drain,
+        // so it doesn't stall the game's whole queue. Bounded timeout prevents any hang
+        // if the GPU is saturated; on timeout we just proceed (a rare single-frame tear
+        // is preferable to a stall). All best-effort: skipped if the fence is absent.
+        if (g_d3d12_copy_fence && g_d3d12_fence_event) {
+            auto* q = reinterpret_cast<ID3D12CommandQueue*>(
+                static_cast<uintptr_t>(rt->get_command_queue()->get_native()));
+            if (q) {
+                const UINT64 target = ++g_d3d12_fence_value;
+                if (SUCCEEDED(q->Signal(g_d3d12_copy_fence, target))) {
+                    if (g_d3d12_copy_fence->GetCompletedValue() < target) {
+                        if (SUCCEEDED(g_d3d12_copy_fence->SetEventOnCompletion(
+                                target, g_d3d12_fence_event))) {
+                            // 8 ms cap: ~half a 60fps frame. Long enough for a local
+                            // SBS copy to finish, short enough to never visibly hitch.
+                            WaitForSingleObject(g_d3d12_fence_event, 8);
+                        }
+                    }
+                }
+            }
+        }
+    }
 
-    // No per-frame Frame_Alternate write: SuperDepth3D is in SBS mode 0, DoubleTex
-    // holds both eyes every frame, so there is no eye to alternate.
+    if (realMutex) sharedTextureMutex->ReleaseSync(0);
 }
 
 // ── Event handlers ─────────────────────────────────────────────────────────────
@@ -1271,8 +1320,6 @@ static void on_reloaded_with_fa(reshade::api::effect_runtime* rt)
     if (rt != g_active_runtime) return;
     g_fs_fa_handle        = find_sd3d_uniform(rt, "FS_FA");
     g_stereo_mode_handle  = find_sd3d_uniform(rt, "Stereoscopic_Mode");
-    g_frame_alt_handle    = find_sd3d_uniform(rt, "Frame_Alternate");
-    g_frame_alt_parity    = false; // reset parity on reload so L is first
     g_tex_cache_dirty  = true;
     // Clear sharedTexture on reload.
     cs_enter();
@@ -1369,6 +1416,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
             static_cast<IUnknown*>(sharedTexture)->Release();
         }
         if (g_d3d12_named_handle) { CloseHandle(g_d3d12_named_handle); g_d3d12_named_handle = nullptr; }
+        if (g_d3d12_copy_fence)  { g_d3d12_copy_fence->Release(); g_d3d12_copy_fence = nullptr; }
+        if (g_d3d12_fence_event) { CloseHandle(g_d3d12_fence_event); g_d3d12_fence_event = nullptr; }
         // Do NOT close KatangaMappedFile on DLL unload.
         // Keeping it alive means reload finds the existing mapping,
         // so KatanaVR stays connected. OS cleans up at process exit.
