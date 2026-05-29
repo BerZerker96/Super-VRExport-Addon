@@ -102,7 +102,7 @@ GeoVrExport sets **nothing automatically** — it simply reads the existing texT
 |---|---|
 | **ReShade** | 6.3.x or newer, installed in **DXGI proxy mode** (`dxgi.dll`) for D3D12 games |
 | **[SuperDepth3D.fx](https://github.com/BlueSkyDefender/Depth3D)** | v5.3.8 or newer — **SuperVrExport only.** Must include `EX_DLP_FS_Mode` and `DoubleBuffer_Mode` preprocessors |
-| **3DToElse.fx** | **GeoVrExport only.** Not required for SuperVrExport (which reads `DoubleTex` directly). Included in the `Effects/` folder |
+| **3DToElse.fx** | **GeoVrExport only.** Included in the `Effects/` folder |
 | **KatanaVR / VRScreenCap** | 0.4.0-dev5 or newer. Must be started **after** the game |
 | **OS** | Windows 10 2004+ or Windows 11 |
 
