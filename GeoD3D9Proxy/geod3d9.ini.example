@@ -1,0 +1,8 @@
+; geod3d9.ini  (optional)
+; Place next to geod3d9.dll (i.e. in the game folder, as d3d9.ini-style sibling).
+; Only needed if your ReShade isn't at the default location ReShade\d3d9.dll.
+
+[geod3d9]
+; Path to the chainloaded ReShade, relative to the proxy (the game folder).
+; ReShade MUST keep the name d3d9.dll so it detects the Direct3D 9 API.
+ReShade=ReShade\d3d9.dll

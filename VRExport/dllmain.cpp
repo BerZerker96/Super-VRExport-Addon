@@ -50,8 +50,9 @@ typedef VkResult(VKAPI_PTR* PFN_vkBindImageMemory)(VkDevice, VkImage, VkDeviceMe
 #define VK_IMAGE_USAGE_SAMPLED_BIT                   4
 #define VK_SHARING_MODE_EXCLUSIVE                    0
 #define VK_IMAGE_LAYOUT_UNDEFINED                    0
-// VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT (0x800) = NT handle — not used.
-// We use D3D11_TEXTURE_KMT_BIT (0x400) via VK_EXT_MEM_KMT defined in share_vulkan.
+// D3D11 KMT handle import type. Real Vulkan enum values (VkExternalMemoryHandleTypeFlagBits):
+//   VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT     = 0x08 (NT handle — not used here)
+//   VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_KMT_BIT = 0x10 (legacy KMT handle — what we use)
 #define VK_FORMAT_R8G8B8A8_UNORM                    37
 #define VK_FORMAT_B8G8R8A8_UNORM                    44
 #define VK_FORMAT_A2B10G10R10_UNORM_PACK32          64
@@ -59,8 +60,11 @@ typedef VkResult(VKAPI_PTR* PFN_vkBindImageMemory)(VkDevice, VkImage, VkDeviceMe
 #define VK_FORMAT_R16G16B16A16_UNORM                91
 #define VK_FORMAT_B10G11R11_UFLOAT_PACK32          122
 #define VK_FORMAT_R32G32B32A32_SFLOAT              109
-#define VK_EXT_MEM_KMT                    0x00000400u // D3D11 KMT handle type for Vulkan import
 #endif
+// Defined for BOTH builds: in the SDK build <vulkan/vulkan.h> provides the real enum but
+// not this short alias; in the stub build the enum isn't present at all. 0x10 is the correct
+// VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_KMT_BIT value (was previously a wrong 0x400).
+#define VK_EXT_MEM_KMT                    0x00000010u // D3D11 KMT handle type for Vulkan import
 #include <GL/gl.h>
 
 // Logging: call ReShadeLogMessage via GetProcAddress — compatible with all header versions.
@@ -847,28 +851,52 @@ static void share_vulkan(reshade::api::resource src_res, reshade::api::device* d
         LOAD_VK(vkAllocateMemory) LOAD_VK(vkFreeMemory) LOAD_VK(vkBindImageMemory)
 #undef LOAD_VK
     }
+
+    // ── Capability guard: the Win32 KMT import below REQUIRES the device to have been
+    // created with VK_KHR_external_memory_win32 enabled. ReShade injects that extension
+    // when IT creates the device (native Vulkan games), but when wrapping a device that
+    // some host (e.g. an emulator) already created without it, the import has no driver
+    // backing and vkAllocateMemory dereferences an unsupported pNext chain → hard crash.
+    // vkGetMemoryWin32HandlePropertiesKHR ONLY resolves via vkGetDeviceProcAddr when that
+    // extension is actually enabled, so it's a reliable probe. If absent, bail cleanly so
+    // the host keeps running flat instead of crashing. (No behavior change on real games.)
+    // Probe the same way the LOAD_VK macro above does: reinterpret the result to a PFN.
+    // vkGetMemoryWin32HandlePropertiesKHR resolves only when the extension is enabled, so
+    // a null PFN means "not found" -> bail cleanly. (No behavior change on real games.)
+    if (reinterpret_cast<PFN_vkBindImageMemory>(
+            vkGetDevProc(vk_dev, "vkGetMemoryWin32HandlePropertiesKHR")) == nullptr) {
+        LOG_ERR("SuperVrExport: Vulkan host device lacks VK_KHR_external_memory_win32 - "
+                "cross-API share unavailable on this host (e.g. emulator). Skipping bridge.");
+        return;
+    }
     // Create D3D11 shared texture first (we control it), get NT handle for Vulkan import.
     HANDLE nt = nullptr;
     ID3D11Texture2D* d11 = create_d3d11_shared(w, h, dxgi_fmt, &nt);
     if (!d11 || !nt) return;
 
     VkImportMemoryWin32HandleInfoKHR imp = {};
-    imp.sType      = VK_STRUCTURE_TYPE_IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR;
-    imp.handleType = VK_EXT_MEM_KMT;
+    imp.sType      = (decltype(imp.sType))VK_STRUCTURE_TYPE_IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR;
+    // handleType is uint32_t in the stub build but a typed enum
+    // (VkExternalMemoryHandleTypeFlagBits) with the real SDK, which needs an explicit cast.
+    // decltype adapts to whichever type the field actually is in this build.
+    imp.handleType = (decltype(imp.handleType))VK_EXT_MEM_KMT;
     imp.handle     = nt;
 
     VkExternalMemoryImageCreateInfo ext = {};
-    ext.sType       = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
-    ext.handleTypes = VK_EXT_MEM_KMT;
+    ext.sType       = (decltype(ext.sType))VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
+    ext.handleTypes = (decltype(ext.handleTypes))VK_EXT_MEM_KMT;
 
     VkImageCreateInfo ic = {};
-    ic.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO; ic.pNext = &ext;
-    ic.imageType = VK_IMAGE_TYPE_2D; ic.format = vk_fmt;
+    // Each field is a plain int/uint in the stub build but a typed enum with the real SDK;
+    // decltype casts adapt to whichever the field actually is, so this compiles in both.
+    ic.sType = (decltype(ic.sType))VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO; ic.pNext = &ext;
+    ic.imageType = (decltype(ic.imageType))VK_IMAGE_TYPE_2D; ic.format = vk_fmt;
     ic.extent = {w, h, 1}; ic.mipLevels = 1; ic.arrayLayers = 1;
-    ic.samples = VK_SAMPLE_COUNT_1_BIT; ic.tiling = VK_IMAGE_TILING_OPTIMAL;
-    ic.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-    ic.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    ic.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    ic.samples = (decltype(ic.samples))VK_SAMPLE_COUNT_1_BIT;
+    ic.tiling = (decltype(ic.tiling))VK_IMAGE_TILING_OPTIMAL;
+    ic.usage = (decltype(ic.usage))(VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+    ic.sharingMode = (decltype(ic.sharingMode))VK_SHARING_MODE_EXCLUSIVE;
+    ic.initialLayout = (decltype(ic.initialLayout))VK_IMAGE_LAYOUT_UNDEFINED;
 
     VkImage img = VK_NULL_HANDLE;
     if (s_vkCreateImage(vk_dev, &ic, nullptr, &img) != VK_SUCCESS) {
@@ -883,7 +911,7 @@ static void share_vulkan(reshade::api::resource src_res, reshade::api::device* d
     for (uint32_t i = 0; i < 32; ++i) {
         if (!((mr.memoryTypeBits >> i) & 1u)) continue; // type not supported for this image
         VkMemoryAllocateInfo ai = {};
-        ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        ai.sType = (decltype(ai.sType))VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
         ai.pNext = &imp; ai.allocationSize = mr.size; ai.memoryTypeIndex = i;
         if (s_vkAllocateMemory(vk_dev, &ai, nullptr, &mem) == VK_SUCCESS) break;
         mem = VK_NULL_HANDLE;
@@ -1221,9 +1249,12 @@ void add_copy_command(reshade::api::effect_runtime* rt,
     }
 
     reshade::api::resource dst;
+    // VkImage is uint64_t in the stub build but a non-dispatchable handle (pointer on x64,
+    // uint64_t on x86) with the real SDK; a C-style cast converts both. Cast both ternary
+    // arms to the same type so the conditional has a well-defined common type.
     dst.handle = (api == reshade::api::device_api::vulkan && g_vk_image)
-        ? static_cast<uint64_t>(g_vk_image)
-        : uint64_t(sharedTexture);
+        ? (uint64_t)(g_vk_image)
+        : (uint64_t)(sharedTexture);
 
     // ── Copy path for D3D9/D3D10/D3D11/D3D12/Vulkan ───────────────────────────
     // copy_resource is recorded on ReShade's immediate command list. Sync regime is

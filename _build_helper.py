@@ -61,7 +61,7 @@ def build(vcvars, src, out, inc, arch, env_base):
     # GeoVrExport mirrors the ORIGINAL addon, which has BOTH a D3D11 and a D3D12
     # sharing path — so it needs d3d12.lib too (the original linked it).
     if "GeoVrExport" in str(out):
-        libs = ["kernel32.lib", "user32.lib", "d3d11.lib", "d3d12.lib", "dxgi.lib"]
+        libs = ["kernel32.lib", "user32.lib", "d3d9.lib", "d3d10.lib", "d3d11.lib", "d3d12.lib", "dxgi.lib"]
     else:
         libs = ["kernel32.lib", "user32.lib", "d3d9.lib", "d3d10.lib",
                 "d3d11.lib", "d3d12.lib", "dxgi.lib", "opengl32.lib"]
@@ -104,13 +104,28 @@ def main():
                 configs.append((src, os.path.join(outdir, f"{addon}.{ext}"), inc, arch))
 
     total = len(configs)
+    failures = []
     for i, (src, out, inc, arch) in enumerate(configs, 1):
         name = os.path.basename(out)
         folder = os.path.basename(os.path.dirname(out))
         print(f"\n[{i}/{total}] {name}  ({folder}, {arch})")
         rc = build(vcvars, src, out, inc, arch, {})
         if rc != 0:
-            return rc
+            failures.append(f"{folder}/{name} ({arch})")
+
+    if failures:
+        print(f"""
+============================================================
+  BUILD FINISHED WITH {len(failures)} FAILURE(S)
+
+  Failed targets:""")
+        for f in failures:
+            print(f"    - {f}")
+        print("""
+  The targets that DID succeed are still written to bin\\.
+  Fix the errors above and re-run to rebuild the rest.
+============================================================""")
+        return 1
 
     folders = "  ".join(f"bin\\{s}\\" for _, s in header_sets)
     print(f"""

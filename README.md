@@ -200,6 +200,71 @@ Direct3D 9 games require an extra step because D3D9's shared texture support is 
 
 ---
 
+## 🧩 D3D9 + Geo-3D — Native Fast Path (`geod3d9.dll`, no dgVoodoo2)
+
+If you're running a **Geo-3D** game on **D3D9** (e.g. Dragon Age: Origins) and want to stay
+fully native — no dgVoodoo2 translation layer — use the **`geod3d9.dll`** proxy shipped in
+the `GeoD3D9Proxy/` folder. It makes GeoVrExport's fast GPU path work on plain D3D9 games.
+
+### Why it's needed
+
+Legacy D3D9 games create a *plain* `IDirect3DDevice9`. A plain (non-Ex) device **cannot create
+or open shared textures**, so GeoVrExport is forced onto a slow full-resolution CPU readback
+every frame (you'll see `D3D9 ready (CPU staging full-res, non-Ex device)` in the log, with poor
+performance). Only an `IDirect3DDevice9Ex` supports the GPU-side shared render target the fast
+path needs.
+
+`geod3d9.dll` sits **in front of** ReShade and transparently upgrades the game's calls
+(`Direct3DCreate9 → Direct3DCreate9Ex`, `CreateDevice → CreateDeviceEx`). Because the upgrade
+happens above ReShade, ReShade itself creates an *extended* device, so GeoVrExport detects
+`IDirect3DDevice9Ex` and runs its GPU shared-surface path — **zero CPU readback**.
+
+```
+game.exe  ->  d3d9.dll (geod3d9 proxy)  ->  ReShade\d3d9.dll (chainloaded)  ->  system d3d9
+```
+
+### Setup
+
+The goal: **only the proxy stays next to the game `.exe`**; ReShade and everything it needs move
+into a `ReShade\` subfolder.
+
+1. **Build the proxy.** In `GeoD3D9Proxy/`, run `build_geod3d9.bat` → produces a 32-bit
+   `geod3d9.dll` (DA:O and most D3D9 games are 32-bit; for a 64-bit game change `/MACHINE:X86`
+   to `/MACHINE:X64`).
+2. **Create a `ReShade\` subfolder** in the game folder (next to `DAOrigins.exe`).
+3. **Move ReShade and its files into `ReShade\`** so nothing but the proxy is left beside the EXE:
+   - `d3d9.dll`  ← ReShade itself (it **must** keep the `d3d9.dll` name so it detects the D3D9 API)
+   - `GeoVrExport.addon32` (and `Geo3D.addon32` if used)
+   - `ReShade.ini`
+   - `ReShadePreset.ini`
+
+   Resulting layout:
+   ```
+   <game>\DAOrigins.exe
+   <game>\d3d9.dll                  <- geod3d9.dll renamed to d3d9.dll  (ONLY this beside the EXE)
+   <game>\ReShade\d3d9.dll          <- ReShade
+   <game>\ReShade\GeoVrExport.addon32
+   <game>\ReShade\Geo3D.addon32
+   <game>\ReShade\ReShade.ini
+   <game>\ReShade\ReShadePreset.ini
+   ```
+4. **Put the proxy beside the EXE.** Copy `geod3d9.dll` into the game folder and rename it to
+   **`d3d9.dll`**. This is now the only DirectX DLL next to the game executable.
+5. *(Optional)* If you put ReShade somewhere other than `ReShade\d3d9.dll`, drop a `geod3d9.ini`
+   next to the proxy pointing at it — see `GeoD3D9Proxy/geod3d9.ini.example`.
+6. **Launch.** In `ReShade.log` you should now see the fast branch:
+   `GeoVrExport: D3D9 ready (D3D9Ex shared)` — instead of the CPU-staging line.
+
+> The proxy never makes a game worse: if the Ex upgrade fails for any reason it silently falls
+> back to a normal `CreateDevice`. It does not modify the GeoVrExport / SuperVrExport addons.
+
+> **dgVoodoo2 vs the proxy:** dgVoodoo2 (D3D9 → D3D11) is the broadest, zero-build option and is
+> still recommended if you just want it working or if a game misbehaves with the proxy. The
+> `geod3d9.dll` proxy is the lighter, fully-native alternative for Geo-3D D3D9 games — see
+> `GeoD3D9Proxy/README.md` for full details and caveats.
+
+---
+
 ## 🔧 Troubleshooting
 
 | Symptom | Fix |
@@ -209,6 +274,7 @@ Direct3D 9 games require an extra step because D3D9's shared texture support is 
 | Flat monitor shows squished side-by-side | Expected — SuperVrExport runs SuperDepth3D in SBS mode so `DoubleTex` is valid. KatanaVR still receives correct full-res SBS |
 | `DoubleTex` looks mono / stretched in the overlay preview | The addon forces SBS mode automatically; if you manually changed `Stereoscopic_Mode` away from Side by Side, `DoubleTex` stops being valid SBS. Leave the mode alone |
 | D3D9 game: black / no connection | Use dgVoodoo2 to translate D3D9 → D3D11. See section above |
+| D3D9 Geo-3D game: very poor performance | Log shows `CPU staging full-res` — install the `geod3d9.dll` proxy so GeoVrExport gets the fast `D3D9Ex shared` path. See "D3D9 + Geo-3D — Native Fast Path" |
 | Addon not in ReShade list | Ensure `.addon64` is next to `dxgi.dll`; reinstall ReShade with "Install add-ons" checked |
 | Game crashes with SuperVrExport | Confirm the game uses SuperDepth3D. For native Geo3D games use GeoVrExport instead |
 | Game crashes with GeoVrExport | Confirm the [Geo-3D](https://github.com/Flugan/Geo3D-Installer) is installed, 3DToElse is enabled, and Stereoscopic Mode Input is set to Frame Sequential |
@@ -221,6 +287,9 @@ Direct3D 9 games require an extra step because D3D9's shared texture support is 
 | `SuperVrExport: D3D12 ready (D3D11 bridge...)` | Working via the D3D11 bridge. Start KatanaVR now |
 | `SuperVrExport: D3D11 ready` | Bridge established — start KatanaVR now |
 | `GeoVrExport: D3D11 ready` | Bridge established — start KatanaVR now |
+| `GeoVrExport: D3D9 ready (D3D9Ex shared)` | **Fast** native D3D9 GPU path — the `geod3d9.dll` proxy is working. Best case for D3D9 |
+| `GeoVrExport: D3D9 ready (CPU staging full-res, non-Ex device)` | Slow fallback — plain D3D9 device, CPU readback each frame. Install the `geod3d9.dll` proxy (see the D3D9 + Geo-3D section) or use dgVoodoo2 |
+| `GeoVrExport: D3D9 GPU share unavailable, falling back` | ReShade couldn't make a shared resource on this device — proxy isn't in front of ReShade. Re-check the load order / folder layout |
 | `first copy fired, src=... dst=...` | GPU copy is working |
 
 ---

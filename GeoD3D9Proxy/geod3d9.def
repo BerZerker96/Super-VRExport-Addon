@@ -1,0 +1,14 @@
+; geod3d9.dll exports — the d3d9 entry points a game imports by name.
+; (Dragon Age: Origins, like ReShade's own proxy, imports these by name, so name
+;  exports are sufficient. If a title imports D3DPERF_* by ordinal, add ordinals here.)
+LIBRARY geod3d9
+EXPORTS
+    Direct3DCreate9
+    Direct3DCreate9Ex
+    D3DPERF_BeginEvent
+    D3DPERF_EndEvent
+    D3DPERF_SetMarker
+    D3DPERF_SetRegion
+    D3DPERF_QueryRepeatFrame
+    D3DPERF_SetOptions
+    D3DPERF_GetStatus
