@@ -6,7 +6,7 @@
 [![Platform](https://img.shields.io/badge/Windows-DX9%20%7C%20DX10%20%7C%20DX11%20%7C%20DX12%20%7C%20Vulkan%20%7C%20OpenGL-0078D4.svg)](#)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-**Two ReShade addons that export stereoscopic 3D output directly to KatanaVR / VRScreenCap at full resolution with zero intermediate capture.**
+**Two ReShade addons that export stereoscopic 3D output directly to KatangaVR / VRScreenCap at full resolution with zero intermediate capture.**
 
 </div>
 
@@ -36,7 +36,7 @@
 
 ## 💡 How It Works
 
-Both addons hook into ReShade's effect pipeline and share the stereo 3D frame with KatanaVR or VRScreenCap every frame via a cross-process DXGI shared texture — no screen capture, no resolution loss, no latency beyond one frame.
+Both addons hook into ReShade's effect pipeline and share the stereo 3D frame with KatangaVR or VRScreenCap every frame via a cross-process DXGI shared texture — no screen capture, no resolution loss, no latency beyond one frame.
 
 ### SuperVrExport pipeline (SuperDepth3D games)
 
@@ -48,9 +48,9 @@ SuperDepth3D (Side by Side mode + Double Buffer, configured automatically)
 SuperVrExport addon
         │  copies DoubleTex directly to a shared GPU texture each frame
         ▼
-KatangaMappedFile  ←  KatanaVR / VRScreenCap reads this handle
+KatangaMappedFile  ←  KatangaVR / VRScreenCap reads this handle
         ▼
- KatanaVR  →  VR headset (full resolution SBS)
+ KatangaVR  →  VR headset (full resolution SBS)
 ```
 
 **What SuperVrExport sets automatically:**
@@ -68,10 +68,10 @@ KatangaMappedFile  ←  KatanaVR / VRScreenCap reads this handle
 
 | Change | Detail |
 |---|---|
-| **Direct `DoubleTex` copy** | The addon now copies SuperDepth3D's `DoubleTex` (full-res SBS) straight to KatanaVR. **3DToElse and Frame Sequential mode are no longer used** — this removes the frame-sequential timing flicker and increases per-eye resolution. `texTOT` remains an automatic fallback. |
+| **Direct `DoubleTex` copy** | The addon now copies SuperDepth3D's `DoubleTex` (full-res SBS) straight to KatangaVR. **3DToElse and Frame Sequential mode are no longer used** — this removes the frame-sequential timing flicker and increases per-eye resolution. `texTOT` remains an automatic fallback. |
 | **SBS mode (0) instead of Frame Sequential (6)** | `DoubleTex` is only written as a valid SBS image when SuperDepth3D is in Side-by-Side mode, so the addon sets `Stereoscopic_Mode = 0`. `FS_FA` / frame alternation are not used. |
 | **Preprocessors set at startup** | `EX_DLP_FS_Mode` and `DoubleBuffer_Mode` are applied once in `init_runtime` before the first compile. The old "DoubleTex not found → forcing reload" recompile cascade has been **removed entirely** — no more reload churn or mid-session mode resets. |
-| **Connection survives runtime recreates** | Enabling a virtual controller, alt-tabbing, or scene transitions trigger a runtime destroy/recreate. The shared resource and `KatangaMappedFile` handle are now **kept alive** across these on D3D11 and D3D12 (native + bridge), so KatanaVR no longer drops the connection. A device-change guard rebuilds correctly if the GPU device is genuinely recreated. |
+| **Connection survives runtime recreates** | Enabling a virtual controller, alt-tabbing, or scene transitions trigger a runtime destroy/recreate. The shared resource and `KatangaMappedFile` handle are now **kept alive** across these on D3D11 and D3D12 (native + bridge), so KatangaVR no longer drops the connection. A device-change guard rebuilds correctly if the GPU device is genuinely recreated. |
 | **Native D3D12 same-device path** | When possible the addon shares a same-device D3D12 resource (named `DX12VRStream`) with zero cross-device copy, falling back to the D3D11 bridge only when the driver rejects the native path. |
 
 
@@ -87,9 +87,9 @@ Geo-3D (injects frame-sequential stereo into D3D11 games)
 GeoVrExport addon
         │  copies texTOT to a shared GPU texture each frame
         ▼
-KatangaMappedFile  ←  KatanaVR / VRScreenCap reads this handle
+KatangaMappedFile  ←  KatangaVR / VRScreenCap reads this handle
         ▼
- KatanaVR  →  VR headset (full resolution SBS)
+ KatangaVR  →  VR headset (full resolution SBS)
 ```
 
 GeoVrExport sets **nothing automatically** — it simply reads the existing texTOT output from 3DToElse and shares it. No SuperDepth3D required. Geo-3D handles stereo generation independently.
@@ -103,7 +103,7 @@ GeoVrExport sets **nothing automatically** — it simply reads the existing texT
 | **ReShade** | 6.3.x or newer, installed in **DXGI proxy mode** (`dxgi.dll`) for D3D12 games |
 | **[SuperDepth3D.fx](https://github.com/BlueSkyDefender/Depth3D)** | v5.3.8 or newer — **SuperVrExport only.** Must include `EX_DLP_FS_Mode` and `DoubleBuffer_Mode` preprocessors |
 | **3DToElse.fx** | **GeoVrExport only.** Included in the `Effects/` folder |
-| **KatanaVR / VRScreenCap** | 0.4.0-dev5 or newer. Must be started **after** the game |
+| **KatangaVR / VRScreenCap** | 0.4.0-dev5 or newer. Must be started **after** the game |
 | **OS** | Windows 10 2004+ or Windows 11 |
 
 ---
@@ -130,7 +130,7 @@ holds a full-res SBS image every frame. Just tune your SuperDepth3D depth/3D set
 to taste as normal.
 
 > Because SuperDepth3D is in SBS mode, your flat monitor will show a squished
-> side-by-side image — that is expected. KatanaVR receives the correct full-res SBS.
+> side-by-side image — that is expected. KatangaVR receives the correct full-res SBS.
 
 ### 5 — Launch the game
 
@@ -138,7 +138,7 @@ Start the game. Within 2–3 seconds the addon writes the shared handle to
 `KatangaMappedFile`. Look for `SuperVrExport: D3D12 ready` (or `D3D11 ready`) in
 `ReShade.log`.
 
-### 6 — Start KatanaVR / VRScreenCap
+### 6 — Start KatangaVR / VRScreenCap
 
 Launch the viewer **after** the game has loaded. It reads `KatangaMappedFile` and opens the shared texture automatically.
 
@@ -177,7 +177,7 @@ Open the ReShade overlay, select the **To_Else** technique, and set:
 
 Start the game. The addon reads texTOT from 3DToElse immediately — no recompile required.
 
-### 7 — Start KatanaVR / VRScreenCap
+### 7 — Start KatangaVR / VRScreenCap
 
 Launch the viewer **after** the game has loaded.
 
@@ -185,7 +185,7 @@ Launch the viewer **after** the game has loaded.
 
 ## 🕹️ D3D9 Games — dgVoodoo2 Required
 
-Direct3D 9 games require an extra step because D3D9's shared texture support is limited and cross-process sharing with KatanaVR works most reliably through D3D11.
+Direct3D 9 games require an extra step because D3D9's shared texture support is limited and cross-process sharing with KatangaVR works most reliably through D3D11.
 
 **Use [dgVoodoo2](https://dege.freeweb.hu/dgVoodoo2/dgVoodoo2/) to translate D3D9 → D3D11:**
 
@@ -269,9 +269,9 @@ into a `ReShade\` subfolder.
 
 | Symptom | Fix |
 |---|---|
-| KatanaVR shows nothing | Restart KatanaVR **after** the game loads. Check `ReShade.log` for `D3D11 ready` / `D3D12 ready` |
-| Black screen in headset | Confirm `first copy fired` in `ReShade.log`. Restart KatanaVR |
-| Flat monitor shows squished side-by-side | Expected — SuperVrExport runs SuperDepth3D in SBS mode so `DoubleTex` is valid. KatanaVR still receives correct full-res SBS |
+| KatangaVR shows nothing | Restart KatangaVR **after** the game loads. Check `ReShade.log` for `D3D11 ready` / `D3D12 ready` |
+| Black screen in headset | Confirm `first copy fired` in `ReShade.log`. Restart KatangaVR |
+| Flat monitor shows squished side-by-side | Expected — SuperVrExport runs SuperDepth3D in SBS mode so `DoubleTex` is valid. KatangaVR still receives correct full-res SBS |
 | `DoubleTex` looks mono / stretched in the overlay preview | The addon forces SBS mode automatically; if you manually changed `Stereoscopic_Mode` away from Side by Side, `DoubleTex` stops being valid SBS. Leave the mode alone |
 | D3D9 game: black / no connection | Use dgVoodoo2 to translate D3D9 → D3D11. See section above |
 | D3D9 Geo-3D game: very poor performance | Log shows `CPU staging full-res` — install the `geod3d9.dll` proxy so GeoVrExport gets the fast `D3D9Ex shared` path. See "D3D9 + Geo-3D — Native Fast Path" |
@@ -283,10 +283,10 @@ into a `ReShade\` subfolder.
 
 | Message | Meaning |
 |---|---|
-| `SuperVrExport: D3D12 ready (NATIVE same-device...)` | Best path — same-device D3D12 share. Start KatanaVR now |
-| `SuperVrExport: D3D12 ready (D3D11 bridge...)` | Working via the D3D11 bridge. Start KatanaVR now |
-| `SuperVrExport: D3D11 ready` | Bridge established — start KatanaVR now |
-| `GeoVrExport: D3D11 ready` | Bridge established — start KatanaVR now |
+| `SuperVrExport: D3D12 ready (NATIVE same-device...)` | Best path — same-device D3D12 share. Start KatangaVR now |
+| `SuperVrExport: D3D12 ready (D3D11 bridge...)` | Working via the D3D11 bridge. Start KatangaVR now |
+| `SuperVrExport: D3D11 ready` | Bridge established — start KatangaVR now |
+| `GeoVrExport: D3D11 ready` | Bridge established — start KatangaVR now |
 | `GeoVrExport: D3D9 ready (D3D9Ex shared)` | **Fast** native D3D9 GPU path — the `geod3d9.dll` proxy is working. Best case for D3D9 |
 | `GeoVrExport: D3D9 ready (CPU staging full-res, non-Ex device)` | Slow fallback — plain D3D9 device, CPU readback each frame. Install the `geod3d9.dll` proxy (see the D3D9 + Geo-3D section) or use dgVoodoo2 |
 | `GeoVrExport: D3D9 GPU share unavailable, falling back` | ReShade couldn't make a shared resource on this device — proxy isn't in front of ReShade. Re-check the load order / folder layout |
