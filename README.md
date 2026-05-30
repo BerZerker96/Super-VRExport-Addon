@@ -200,9 +200,9 @@ Direct3D 9 games require an extra step because D3D9's shared texture support is 
 
 ---
 
-## 🧩 D3D9 + Geo-3D — Native Fast Path (`geod3d9.dll`, no dgVoodoo2)
+## 🧩 D3D9 + SuperDepth3D or Geo-3D — Native Fast Path (`geod3d9.dll`, no dgVoodoo2)
 
-If you're running a **Geo-3D** game on **D3D9** (e.g. Dragon Age: Origins) and want to stay
+If you're running a **SuperDepth3D or Geo-3D** game on **D3D9** (e.g. Dragon Age: Origins) and want to stay
 fully native — no dgVoodoo2 translation layer — use the **`geod3d9.dll`** proxy shipped in
 the `GeoD3D9Proxy/` folder. It makes GeoVrExport's fast GPU path work on plain D3D9 games.
 
