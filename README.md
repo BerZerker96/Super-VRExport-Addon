@@ -39,6 +39,7 @@
 Both addons hook into ReShade's effect pipeline and share the stereo 3D frame with KatangaVR or VRScreenCap every frame via a cross-process DXGI shared texture — no screen capture, no resolution loss, no latency beyond one frame.
 
 ### SuperVrExport pipeline (SuperDepth3D games)
+<img width="1383" height="544" alt="1_2" src="https://github.com/user-attachments/assets/f3137be6-b9cd-4ac3-801e-b2a00e28f51b" />
 
 ```
 SuperDepth3D (Side by Side mode + Double Buffer, configured automatically)
