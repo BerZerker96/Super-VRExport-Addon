@@ -6,7 +6,7 @@
 [![Platform](https://img.shields.io/badge/Windows-DX9%20%7C%20DX10%20%7C%20DX11%20%7C%20DX12%20%7C%20Vulkan%20%7C%20OpenGL-0078D4.svg)](#)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-**Two ReShade addons that export stereoscopic 3D output directly to KatangaVR / VRScreenCap at full resolution with zero intermediate capture.**
+**Two ReShade addons that export stereoscopic 3D output directly to Osiris Vr Viewer / VRScreenCap at full resolution with zero intermediate capture.**
 
 </div>
 
